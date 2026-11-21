@@ -1,33 +1,35 @@
 # SoundSnap
 
-<img src="src/soundsnap.png" alt="Логотип SoundSnap" width="48" height="48">
+**English** · [Русский](README.ru.md)
 
-SoundSnap — небольшая утилита для Windows, которая переключает звук между колонками, наушниками и другими выходами одним кликом по значку в трее или горячей клавишей. Например, можно оставить в быстром переключении только колонки и гарнитуру, сохранив доступ ко всем остальным выходам из панели.
+<img src="src/soundsnap.png" alt="SoundSnap logo" width="48" height="48">
 
-## Скачать
+SoundSnap is a lightweight Windows utility for switching between speakers, headphones, and other audio outputs with one click in the system tray or a global keyboard shortcut. Pick which devices to cycle through and keep every other output available for manual selection.
 
-Скачайте **SoundSnap.exe** из раздела [Releases](../../releases/latest) и запустите его. Сборка предназначена для Windows x64 и не требует установки. Если значок не виден, откройте список скрытых значков Windows.
+## Download
 
-## Управление
+Download **SoundSnap.exe** from the [latest release](https://github.com/faqbooooy/SoundSnap/releases/latest) and run it. The app is built for Windows x64 and requires no installer. If you don't see the icon, check the hidden icons in the Windows system tray.
 
-| Действие | Результат |
+## Controls
+
+| Action | Result |
 | --- | --- |
-| Левый клик по значку | Переключить звук на следующий выход из быстрого списка |
-| `Ctrl + Alt + F9` | Переключить звук с клавиатуры. Сочетание можно изменить в настройках |
-| Наведение на значок и прокрутка | Показать полоску громкости и изменить уровень колёсиком |
-| Средняя кнопка мыши по значку | Выключить или вернуть звук на текущем выходе |
-| Правый клик → **Открыть** | Показать панель с устройствами и громкостью |
+| Left-click the tray icon | Switch to the next output in your quick-switch list |
+| `Ctrl + Alt + F9` | Switch outputs with the default shortcut. You can change it in Settings |
+| Hover over the tray icon and scroll | Show the volume indicator and adjust the level |
+| Middle-click the tray icon | Mute or unmute the current output |
+| Right-click → **Открыть** (Open) | Open the device and volume panel |
 
-На главной панели видны активный выход и следующий в цикле. **Все устройства** раскрывает полный список для ручного выбора. В **Настроить список** отметьте галочками выходы для быстрого переключения. Изменения сохраняются сразу.
+The main panel shows the active output and the next one in the cycle. Open **Все устройства** (All devices) to select any connected output manually, or use **Настроить список** (Edit list) to choose which devices the tray click and shortcut cycle through. Changes are saved immediately.
 
-SoundSnap запоминает громкость отдельно для каждого выхода. При переключении через приложение сохранённый уровень выставляется на целевом устройстве до перенаправления звука. Если выставить сохранённый уровень не удалось, SoundSnap оставит текущий выход.
+SoundSnap remembers the volume for each output. When switching through the app, it applies the saved level to the destination before routing audio there. If the level cannot be applied, SoundSnap keeps the current output.
 
-## Настройки и обновление
+## Settings and updates
 
-В настройках доступны светлая, тёмная и системная темы, горячая клавиша и автозапуск. Настройки приложения сохраняются в `%APPDATA%\SoftAudioSwitch\settings.json`, выбор выходов и их громкость — в реестре текущего пользователя. При переносе EXE на другой компьютер настройки остаются в старом профиле Windows.
+Settings include light, dark, and system themes, a custom keyboard shortcut, and optional startup with Windows. App preferences are stored in `%APPDATA%\SoftAudioSwitch\settings.json`. Device choices and volume levels are stored in the current user's Windows registry. Moving the EXE to another PC does not transfer these settings.
 
-Чтобы обновиться, выберите **Выход** в меню значка и замените EXE в той же папке. Если включили автозапуск и хотите перенести файл, выключите автозапуск перед переносом и снова включите его из нового расположения.
+To update, select **Выход** (Exit) from the tray menu and replace the EXE in the same folder. If startup is enabled and you want to move the EXE, turn startup off before moving it and re-enable it from the new location.
 
-## Сборка из исходников
+## Build from source
 
-SoundSnap написан на Rust и использует нативные Windows API. Команды и путь к результату указаны в [BUILD.md](BUILD.md).
+SoundSnap is written in Rust and uses native Windows APIs. See [BUILD.md](BUILD.md) for build commands and the output path.
