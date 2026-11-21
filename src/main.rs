@@ -6,12 +6,14 @@ extern crate alloc;
 
 mod audio;
 mod gfx;
+mod motion;
 mod palette;
 mod profile_app;
 mod profile_ui;
 mod profiles;
 mod runtime;
 mod settings;
+mod tray_mouse;
 mod ui;
 
 use alloc::{string::String, vec::Vec};
@@ -41,6 +43,9 @@ const HINT_TIMER: usize = 2;
 const TRAY_TIMER: usize = 3;
 const VOLUME_HOVER_TIMER: usize = 4;
 const EDIT_ANIMATION_TIMER: usize = 5;
+const SLIDER_TIMER: usize = 7;
+const SLIDER_INTERVAL_MS: u32 = 16;
+const MOTION_TIMER: usize = 8;
 const EDIT_WIGGLE: [f32; 13] = [0.,1.4,2.3,1.1,-1.2,-2.1,-0.8,0.9,1.35,0.55,-0.55,-0.5,0.];
 const SHORTCUT_HINT: &str = "Нажмите на сочетание, чтобы изменить его";
 const THEME_HINT: &str = "Применяется сразу";
@@ -52,8 +57,6 @@ const EX_PASSIVE: u32 = EX_CUSTOM | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
 
 // Only the owner thread dispatches window messages. Core Audio callbacks post back to it.
 static mut APP: *const RefCell<App> = null();
-static mut MOUSE_HOST: HWND = null_mut();
-static mut MIDDLE_CAPTURED: bool = false;
 
 pub fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain([0]).collect() }
 
@@ -143,8 +146,7 @@ unsafe fn run_single_instance(demo: bool) -> i32 {
     app.sync_profile_hotkeys();
     let slot = RefCell::new(app);
     APP = &slot;
-    MOUSE_HOST = host;
-    let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(tray_mouse_proc), instance, 0);
+    let tray_mouse = tray_mouse::TrayMouse::start(host);
     let mut message: MSG = zeroed();
     let status = loop {
         match GetMessageW(&mut message, null_mut(), 0, 0) {
@@ -153,36 +155,10 @@ unsafe fn run_single_instance(demo: bool) -> i32 {
             _ => { TranslateMessage(&message); DispatchMessageW(&message); }
         }
     };
-    if !mouse_hook.is_null() { UnhookWindowsHookEx(mouse_hook); }
-    MOUSE_HOST = null_mut();
+    drop(tray_mouse);
     APP = null();
     drop(slot);
     status
-}
-
-unsafe extern "system" fn tray_mouse_proc(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 {
-        match message as u32 {
-            WM_MBUTTONUP if MIDDLE_CAPTURED => {
-                MIDDLE_CAPTURED = false;
-                return 1;
-            }
-            WM_MOUSEWHEEL | WM_MBUTTONDOWN => {
-                let input = &*(data as *const MSLLHOOKSTRUCT);
-                if tray_icon_at(MOUSE_HOST, input.pt).is_some() {
-                    if message as u32 == WM_MOUSEWHEEL {
-                        let delta = (input.mouseData >> 16) as i16;
-                        if PostMessageW(MOUSE_HOST, TRAY_WHEEL, delta as isize as usize, 0) != 0 { return 1; }
-                    } else if PostMessageW(MOUSE_HOST, TRAY_MUTE, 0, 0) != 0 {
-                        MIDDLE_CAPTURED = true;
-                        return 1;
-                    }
-                }
-            }
-            _ => (),
-        }
-    }
-    CallNextHookEx(null_mut(), code, message, data)
 }
 
 unsafe fn tray_icon_at(host: HWND, point: POINT) -> Option<RECT> {
@@ -229,9 +205,16 @@ enum WindowKind { Hidden, Popup, Settings, Profiles, Menu }
 struct Layer {
     hwnd: HWND,
     pixels: Option<Surface>,
+    position: POINT,
+    shown: bool,
+    frame: motion::Frame,
+    transition: Option<motion::Transition>,
 }
 impl Layer {
-    fn new() -> Self { Self { hwnd: null_mut(), pixels: None } }
+    fn new() -> Self {
+        Self { hwnd: null_mut(), pixels: None, position: POINT {x:0,y:0}, shown: false,
+            frame: motion::Frame::REST, transition: None }
+    }
     fn ensure(&mut self, instance: HINSTANCE, passive: bool, title: &str) -> bool {
         if self.hwnd.is_null() {
             self.hwnd = unsafe { make_window(instance, if passive { EX_PASSIVE } else { EX_CUSTOM }, title) };
@@ -241,16 +224,77 @@ impl Layer {
         !self.hwnd.is_null()
     }
     fn paint(&mut self, position: POINT, w: i32, h: i32, scale: f32, paint: impl FnOnce(&gfx::Painter)) -> bool {
+        self.position = position;
         let width = ceil_pixels(w as f32 * scale);
         let height = ceil_pixels(h as f32 * scale);
         if self.pixels.as_ref().is_none_or(|surface| surface.width != width || surface.height != height) {
             self.pixels = Surface::new(width, height);
         }
-        self.pixels.as_mut().is_some_and(|surface| surface.draw(scale, paint) && surface.present(self.hwnd, position))
+        self.pixels.as_mut().is_some_and(|surface| surface.draw(scale, paint)) && self.present()
+    }
+    fn present(&self) -> bool {
+        let position = POINT { x: self.position.x, y: self.position.y + self.frame.offset };
+        self.pixels.as_ref().is_some_and(|surface| surface.present(self.hwnd,position,self.frame.opacity))
+    }
+    fn reveal(&mut self, passive: bool) {
+        if !self.shown {
+            unsafe { ShowWindow(self.hwnd,if passive {SW_SHOWNOACTIVATE} else {SW_SHOW}); }
+            self.shown = true;
+        }
+    }
+    fn fade_in(&mut self, opacity: u8, offset: i32, duration: u64) {
+        if !self.transition.as_ref().is_some_and(motion::Transition::closing) {
+            let opacity = if self.shown { self.frame.opacity.min(opacity) } else { opacity };
+            let offset = if self.shown { self.frame.offset.min(offset) } else { offset };
+            self.frame = motion::Frame { opacity, offset };
+        }
+        self.transition = Some(motion::Transition::new(self.frame,motion::Frame::REST,duration));
+    }
+    fn prepare_passive(&mut self, enabled: bool, offset: i32) {
+        if enabled && (!self.shown || self.transition.as_ref().is_some_and(motion::Transition::closing)) {
+            self.fade_in(24,offset,115);
+        }
+    }
+    fn dismiss(&mut self, enabled: bool, offset: i32) {
+        if !enabled || !self.shown || self.pixels.is_none() {
+            self.hide();
+        } else if !self.transition.as_ref().is_some_and(motion::Transition::closing) {
+            if self.frame.opacity == 0 {
+                self.hide();
+            } else {
+                let end = motion::Frame { opacity: 0, offset };
+                self.transition = Some(motion::Transition::new(self.frame,end,85));
+            }
+        }
+    }
+    fn advance(&mut self, time: u64) -> bool {
+        let Some(transition) = &self.transition else { return false; };
+        if let Some(frame) = transition.frame(time) {
+            if self.frame != frame {
+                self.frame = frame;
+                self.present();
+            }
+            true
+        } else {
+            self.finish_motion();
+            false
+        }
+    }
+    fn finish_motion(&mut self) {
+        if let Some(transition) = self.transition.take() {
+            if transition.closing() { self.hide(); }
+            else {
+                self.frame = motion::Frame::REST;
+                self.present();
+            }
+        }
     }
     fn hide(&mut self) {
-        if !self.hwnd.is_null() { unsafe { ShowWindow(self.hwnd, SW_HIDE); } }
+        if self.shown { unsafe { ShowWindow(self.hwnd, SW_HIDE); } }
+        self.shown = false;
         self.pixels = None;
+        self.transition = None;
+        self.frame = motion::Frame::REST;
     }
 }
 impl Drop for Layer {
@@ -296,7 +340,9 @@ struct App {
     edit_frame: usize, wheel_remainder: i32,
     window: Layer, toast: Layer, hint: Layer, notice: Option<Notice>, kind: WindowKind,
     volume_popup: Layer, volume_anchor: Option<RECT>,
+    motion_enabled: bool, motion_timer: bool,
     form: Option<SettingsView>, hover: Option<Action>, focus: Option<Action>, pressed: Option<Action>,
+    slider_update: Option<(Action, i32)>,
     width: i32, height: i32, scale: f32, rows: usize, start: usize, area: RECT,
     position: POINT, anchor: POINT, tracking_mouse: bool,
 }
@@ -308,12 +354,14 @@ impl App {
             instance, host, taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
             icon: null_mut(), tray_exists: false, dark: settings::dark(settings.theme), taskbar_dark: settings::taskbar_dark(),
             tray_muted: false, volume_popup: Layer::new(), volume_anchor: None,
+            motion_enabled: motion::allowed(), motion_timer: false,
             settings, hotkey_id: 0, hotkey: None, profiles: ProfileState::new(), audio: Audio::default(), devices: Vec::new(),
             demo_devices: Vec::new(),
             editing_devices: false, other_expanded: false, excluded: Vec::new(),
             edit_frame: 0, wheel_remainder: 0,
             device_error: false, volume: None, window: Layer::new(), toast: Layer::new(), hint: Layer::new(),
             notice: None, kind: WindowKind::Hidden, form: None, hover: None, focus: None, pressed: None,
+            slider_update: None,
             width: 0, height: 0, scale: 1., rows: 4, start: 0, area: unsafe { zeroed() },
             position: POINT {x:0,y:0}, anchor: POINT {x:0,y:0}, tracking_mouse: false,
         }
@@ -358,6 +406,48 @@ impl App {
     }
 
     fn palette(&self) -> &'static Palette { if self.dark { &DARK } else { &LIGHT } }
+    fn wake_motion(&mut self) {
+        if self.motion_timer { return; }
+        let running = [&self.window,&self.toast,&self.hint,&self.volume_popup]
+            .iter().any(|layer| layer.transition.is_some());
+        if running {
+            self.motion_timer = unsafe { SetTimer(self.host,MOTION_TIMER,motion::FRAME_MS,None) } != 0;
+            if !self.motion_timer { self.finish_motion(); }
+        }
+    }
+    fn motion_tick(&mut self) {
+        let time = motion::now();
+        let mut running = false;
+        for layer in [&mut self.window,&mut self.toast,&mut self.hint,&mut self.volume_popup] {
+            running |= layer.advance(time);
+        }
+        if !running {
+            unsafe { KillTimer(self.host,MOTION_TIMER); }
+            self.motion_timer = false;
+        }
+    }
+    fn finish_motion(&mut self) {
+        for layer in [&mut self.window,&mut self.toast,&mut self.hint,&mut self.volume_popup] {
+            layer.finish_motion();
+        }
+        if self.motion_timer {
+            unsafe { KillTimer(self.host,MOTION_TIMER); }
+            self.motion_timer = false;
+        }
+    }
+    fn sync_motion_preference(&mut self) {
+        self.motion_enabled = motion::allowed();
+        if !self.motion_enabled {
+            self.finish_motion();
+            self.stop_device_animation();
+            self.draw_window();
+        }
+    }
+    fn begin_page_motion(&mut self) {
+        if self.motion_enabled && self.window.shown {
+            self.window.fade_in(208,0,135);
+        }
+    }
     fn sync_theme(&mut self) {
         let tray = settings::taskbar_dark();
         if self.taskbar_dark != tray {
@@ -368,6 +458,7 @@ impl App {
         let changed = dark != self.dark;
         self.dark = dark;
         if changed {
+            if self.kind != WindowKind::Hidden { self.begin_page_motion(); }
             self.draw_window();
             self.draw_toast();
             self.draw_volume_popup();
@@ -445,8 +536,25 @@ impl App {
             Err(_) => self.notify("Не удалось выбрать устройство", "Проверьте, что оно подключено"),
         }
     }
-    fn volume_at(&mut self, x: f32) {
-        self.set_volume_level(ui::volume_level(x));
+    fn queue_slider(&mut self, action: Action, x: f32) {
+        let level = if action == Action::Volume { ui::volume_level(x) } else { profile_ui::level(x) };
+        // Mouse moves can arrive much faster than Core Audio and the window can update.
+        // Keep only the latest position and leave the scheduled frame in place.
+        let first = self.slider_update.replace((action, level)).is_none();
+        if first && unsafe { SetTimer(self.host, SLIDER_TIMER, SLIDER_INTERVAL_MS, None) } == 0 {
+            self.flush_slider();
+        }
+    }
+    fn flush_slider(&mut self) {
+        if let Some((action,level)) = self.take_slider() {
+            if action == Action::Volume { self.set_volume_level(level); }
+            else { self.profile_slider(action,level); }
+        }
+    }
+    fn take_slider(&mut self) -> Option<(Action, i32)> {
+        let update = self.slider_update.take();
+        if update.is_some() { unsafe { KillTimer(self.host, SLIDER_TIMER); } }
+        update
     }
     fn set_volume_level(&mut self, level: i32) {
         let Some(volume) = self.volume else { return };
@@ -488,7 +596,8 @@ impl App {
     fn hide_volume_popup(&mut self) {
         if self.volume_anchor.take().is_some() {
             unsafe { KillTimer(self.host, VOLUME_HOVER_TIMER); }
-            self.volume_popup.hide();
+            self.volume_popup.dismiss(self.motion_enabled,1);
+            self.wake_motion();
         }
     }
     fn draw_volume_popup(&mut self) {
@@ -509,10 +618,14 @@ impl App {
             y: y.clamp(work.top, (work.bottom - height).max(work.top)),
         };
         let palette = self.palette();
+        self.volume_popup.prepare_passive(self.motion_enabled,1);
         if self.volume_popup.ensure(self.instance, true, "SoundSnap — громкость")
             && self.volume_popup.paint(position, ui::TRAY_VOLUME_WIDTH, ui::TRAY_VOLUME_HEIGHT, scale,
                 |g| ui::tray_volume(g, palette, volume)) {
-            unsafe { ShowWindow(self.volume_popup.hwnd, SW_SHOWNOACTIVATE); }
+            self.volume_popup.reveal(true);
+            self.wake_motion();
+        } else {
+            self.volume_popup.hide();
         }
     }
     fn refresh_device_page(&mut self, focus: Action) {
@@ -522,6 +635,7 @@ impl App {
         self.refresh_devices();
         self.focus = Some(focus);
         self.geometry();
+        if !(self.editing_devices && focus == Action::EditDevices) { self.begin_page_motion(); }
         self.draw_window();
     }
 
@@ -529,14 +643,8 @@ impl App {
         self.editing_devices = !self.editing_devices;
         self.start = 0;
         self.stop_device_animation();
-        if self.editing_devices {
-            let mut enabled = 0i32;
-            unsafe {
-                if SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&mut enabled as *mut i32).cast(), 0) != 0
-                    && enabled != 0 {
-                    SetTimer(self.host, EDIT_ANIMATION_TIMER, 22, None);
-                }
-            }
+        if self.editing_devices && self.motion_enabled {
+            unsafe { SetTimer(self.host, EDIT_ANIMATION_TIMER, 22, None); }
         }
         self.refresh_device_page(Action::EditDevices);
     }
@@ -584,12 +692,20 @@ impl App {
             return;
         }
         self.geometry();
+        if opening {
+            // A closing window is click-through until re-opened.
+            unsafe { SetWindowLongPtrW(self.window.hwnd,GWL_EXSTYLE,EX_CUSTOM as isize); }
+            if self.motion_enabled { self.window.fade_in(if self.window.shown {255} else {24},0,145); }
+        } else {
+            self.begin_page_motion();
+        }
         if self.draw_window() {
+            self.window.reveal(false);
             unsafe {
-                if opening { ShowWindow(self.window.hwnd, SW_SHOW); }
                 if GetForegroundWindow() != self.window.hwnd { SetForegroundWindow(self.window.hwnd); }
             }
         } else {
+            self.window.hide();
             self.hide();
         }
     }
@@ -621,15 +737,18 @@ impl App {
         let profiles = self.profiles.view(self.profile_height_budget());
         let (hover, focus, mode, kind, form) = (self.hover,self.focus,self.settings.theme,self.kind,self.form.as_ref());
         if kind == WindowKind::Hidden || self.window.hwnd.is_null() { return false; }
-        self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
+        let painted = self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
             WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
             WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
             WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
             WindowKind::Menu => ui::menu(g, palette, hover, focus),
             WindowKind::Hidden => (),
-        })
+        });
+        if painted { self.wake_motion(); }
+        painted
     }
     fn leave_page(&mut self) {
+        self.take_slider();
         if self.kind == WindowKind::Popup {
             self.stop_device_animation();
             self.devices.clear();
@@ -649,7 +768,11 @@ impl App {
         self.kind = WindowKind::Hidden;
         self.sync_profile_timer();
         self.tracking_mouse = false;
-        self.window.hide();
+        if self.motion_enabled && self.window.shown {
+            unsafe { SetWindowLongPtrW(self.window.hwnd,GWL_EXSTYLE,EX_PASSIVE as isize); }
+        }
+        self.window.dismiss(self.motion_enabled,0);
+        self.wake_motion();
     }
 
     fn notify(&mut self, title: &str, text: &str) {
@@ -663,14 +786,19 @@ impl App {
         let (area, scale) = screen(note.monitor);
         let position = POINT { x: (area.right - ceil_pixels((ui::TOAST_WIDTH + 16) as f32 * scale)).max(area.left),
             y: (area.bottom - ceil_pixels((ui::TOAST_HEIGHT + 16) as f32 * scale)).max(area.top) };
+        self.toast.prepare_passive(self.motion_enabled,ceil_pixels(5. * scale));
         if self.toast.ensure(self.instance, true, "Звук — уведомление")
             && self.toast.paint(position, ui::TOAST_WIDTH, ui::TOAST_HEIGHT, scale, |g| ui::toast(g,palette,&note.title,&note.text)) {
-            unsafe { ShowWindow(self.toast.hwnd, SW_SHOWNOACTIVATE); }
+            self.toast.reveal(true);
+            self.wake_motion();
+        } else {
+            self.toast.hide();
         }
     }
     fn hide_hint(&mut self) {
         unsafe { KillTimer(self.host, HINT_TIMER); }
-        self.hint.hide();
+        self.hint.dismiss(self.motion_enabled,1);
+        self.wake_motion();
     }
     fn show_hint(&mut self) {
         unsafe { KillTimer(self.host, HINT_TIMER); }
@@ -691,6 +819,7 @@ impl App {
         let width = (text.chars().count() as i32 * 7 + 20).clamp(110, 450);
         let position = POINT { x: position.x.min(self.area.right - (width as f32*self.scale) as i32).max(self.area.left),
             y: (position.y + 19).min(self.area.bottom - (30.*self.scale) as i32).max(self.area.top) };
+        self.hint.prepare_passive(self.motion_enabled,2);
         if self.hint.ensure(self.instance, true, "Устройство вывода")
             && self.hint.paint(position, width, 28, self.scale, |g| {
                 g.use_panel_typography();
@@ -698,7 +827,10 @@ impl App {
                 g.rounded(r,5.,palette.surface,Some(palette.border));
                 g.text(text,gfx::rect(7.,0.,width as f32-14.,28.),12.,false,0,palette.ink);
             }) {
-            unsafe { ShowWindow(self.hint.hwnd, SW_SHOWNOACTIVATE); }
+            self.hint.reveal(true);
+            self.wake_motion();
+        } else {
+            self.hint.hide();
         }
     }
 
@@ -948,11 +1080,21 @@ impl App {
                 TRAY_MUTE => self.tray_mute(),
                 WM_HOTKEY if self.hotkey_id != 0 && wp as i32 == self.hotkey_id => self.switch_next(),
                 WM_HOTKEY => self.profile_hotkey(wp as i32),
-                WM_SETTINGCHANGE | WM_THEMECHANGED => self.sync_theme(),
+                WM_SETTINGCHANGE => {
+                    self.sync_motion_preference();
+                    self.sync_theme();
+                }
+                WM_THEMECHANGED => self.sync_theme(),
                 audio::WM_ENDPOINTS => {
                     unsafe {
                         let mut ignored: MSG = zeroed();
                         while PeekMessageW(&mut ignored,self.host,audio::WM_ENDPOINTS,audio::WM_ENDPOINTS,PM_REMOVE) != 0 {}
+                    }
+                    if self.pressed.is_some_and(|action| action == Action::Volume
+                        || (matches!(action,Action::AppVolume(_)) && self.profiles.page == profile_ui::Page::Mixer)) {
+                        self.take_slider();
+                        self.pressed = None;
+                        unsafe { if GetCapture() == self.window.hwnd { ReleaseCapture(); } }
                     }
                     self.profile_endpoint_changed();
                     if self.kind == WindowKind::Popup {
@@ -975,9 +1117,12 @@ impl App {
                 WM_TIMER if wp == TOAST_TIMER => {
                     unsafe { KillTimer(self.host, TOAST_TIMER); }
                     self.notice = None;
-                    self.toast.hide();
+                    self.toast.dismiss(self.motion_enabled,3);
+                    self.wake_motion();
                 }
                 WM_TIMER if wp == HINT_TIMER => self.show_hint(),
+                WM_TIMER if wp == SLIDER_TIMER => self.flush_slider(),
+                WM_TIMER if wp == MOTION_TIMER => self.motion_tick(),
                 WM_TIMER if wp == profile_app::TIMER => self.profile_tick(),
                 WM_TIMER if wp == EDIT_ANIMATION_TIMER => {
                     if self.kind == WindowKind::Popup && self.editing_devices {
@@ -1021,9 +1166,8 @@ impl App {
             WM_KEYDOWN | WM_SYSKEYDOWN => { if !self.key(wp as u32) { return None; } }
             WM_MOUSEWHEEL => self.scroll((wp >> 16) as i16 as i32),
             WM_MOUSEMOVE => {
-                if self.pressed == Some(Action::Volume) { self.volume_at(x); return Some(0); }
-                if let Some(action) = self.pressed.filter(|action| is_profile_slider(*action)) {
-                    self.profile_slider(action,profile_ui::level(x));
+                if let Some(action) = self.pressed.filter(|action| is_slider(*action)) {
+                    self.queue_slider(action,x);
                     return Some(0);
                 }
                 if !self.tracking_mouse {
@@ -1049,26 +1193,26 @@ impl App {
             WM_LBUTTONDOWN => {
                 self.hide_hint();
                 self.pressed = self.hit(x,y);
-                self.focus = self.pressed.filter(|action| *action == Action::Volume || is_profile_slider(*action));
+                self.focus = self.pressed.filter(|action| is_slider(*action));
                 if self.pressed.is_some() { unsafe { SetCapture(hwnd); } }
-                if self.pressed == Some(Action::Volume) { self.volume_at(x); }
-                if let Some(action) = self.pressed.filter(|action| is_profile_slider(*action)) {
-                    self.profile_slider(action,profile_ui::level(x));
-                }
+                if let Some(action) = self.focus { self.queue_slider(action,x); }
             }
             WM_LBUTTONUP => {
                 let pressed = self.pressed.take();
-                if pressed == Some(Action::Volume) { self.volume_at(x); }
-                if let Some(action) = pressed.filter(|action| is_profile_slider(*action)) {
-                    self.profile_slider(action,profile_ui::level(x));
+                if let Some(action) = pressed.filter(|action| is_slider(*action)) {
+                    self.queue_slider(action,x);
+                    self.flush_slider();
                 }
                 unsafe { if GetCapture() == hwnd { ReleaseCapture(); } }
                 let hit = self.hit(x,y);
-                if let Some(action) = pressed.filter(|item| Some(*item) == hit && *item != Action::Volume && !is_profile_slider(*item)) {
+                if let Some(action) = pressed.filter(|item| Some(*item) == hit && !is_slider(*item)) {
                     self.invoke(action);
                 }
             }
-            WM_CAPTURECHANGED => { self.pressed = None; }
+            WM_CAPTURECHANGED => {
+                self.pressed = None;
+                self.flush_slider();
+            }
             WM_DPICHANGED => {
                 self.scale = ((wp & 0xffff) as f32 / 96.).max(1.);
                 (self.area, _) = screen(self.anchor);
@@ -1108,6 +1252,7 @@ fn cursor() -> POINT {
 fn is_profile_slider(action: Action) -> bool {
     matches!(action, Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_))
 }
+fn is_slider(action: Action) -> bool { action == Action::Volume || is_profile_slider(action) }
 fn ceil_pixels(value: f32) -> i32 {
     let whole = value as i32;
     whole + i32::from(value > whole as f32)

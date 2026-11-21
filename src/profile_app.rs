@@ -113,6 +113,7 @@ impl App {
         }
         self.sync_profile_timer();
         self.geometry();
+        self.begin_page_motion();
         self.draw_window();
     }
 
@@ -269,6 +270,7 @@ impl App {
 
     pub(crate) fn profile_slider(&mut self, action: Action, level: i32) {
         let level = level.clamp(0, 100);
+        if self.profile_slider_level(action) == Some(level) { return; }
         match action {
             Action::ProfileMaster => {
                 if let Some(draft) = &mut self.profiles.draft { draft.volume.level = level; }

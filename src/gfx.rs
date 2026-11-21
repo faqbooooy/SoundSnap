@@ -169,10 +169,10 @@ impl Surface {
             ready
         }
     }
-    pub fn present(&self, window: HWND, position: POINT) -> bool {
+    pub fn present(&self, window: HWND, position: POINT, opacity: u8) -> bool {
         let size = SIZE { cx: self.width, cy: self.height };
         let source = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255,
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: opacity,
             AlphaFormat: AC_SRC_ALPHA as u8 };
         unsafe { UpdateLayeredWindow(window, null_mut(), &position, &size, self.dc, &source, 0, &blend, ULW_ALPHA) != 0 }
     }
