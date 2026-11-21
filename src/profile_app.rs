@@ -1,18 +1,15 @@
 use alloc::{collections::{BTreeMap, BTreeSet}, format, string::String, vec::Vec};
-use crate::{audio::{Device, Session, Volume}, locale::tr, mixer, profile_ui::{Page, View},
-    profiles::{self, AppLevel, Output, Profile}, settings::Shortcut, ui::Action, App, WindowKind};
+use crate::{app_picker::{self, Choice, ExeSelection}, audio::{Device, Session, Volume}, automation, locale::tr, mixer, profile_ui::{Page, View},
+    profiles::{self, AppLevel, Output, Profile, Trigger}, settings::Shortcut, ui::Action, App, WindowKind};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer,SetTimer};
 const HOTKEY_BASE: i32 = 1000;
 const HOTKEY_PROBE: i32 = 2000;
 
-pub struct AppChoice {
-    pub app: AppLevel,
-    pub sessions: usize,
-    pub persistent: bool,
-}
-
+#[derive(Clone)]
 struct Running {
-    index: usize,
+    index: Option<usize>,
+    profile: Profile,
     output: Option<String>,
     degraded: bool,
     apps_allowed: bool,
@@ -25,15 +22,22 @@ pub struct ProfileState {
     draft: Option<Profile>,
     draft_index: Option<usize>,
     running: Option<Running>,
+    before_automation: Option<Running>,
     pub page: Page,
     pub entry: Page,
     pub typing: bool,
     pub capturing: bool,
+    automation: automation::State,
+    query: String,
+    select_text: bool,
+    running_apps: Vec<Trigger>,
+    resolved_popular: BTreeMap<usize, String>,
+    show_popular: bool,
     start: usize,
     outputs: Vec<Device>,
     apps: Vec<AppLevel>,
     playing: Vec<bool>,
-    choices: Vec<AppChoice>,
+    choices: Vec<Choice>,
     mixer: Option<mixer::Worker>,
     mixer_rows: Vec<mixer::Row>,
     mixer_output: Option<Output>,
@@ -56,8 +60,10 @@ pub struct ProfileState {
 
 impl ProfileState {
     pub fn new() -> Self {
-        Self { list: profiles::load(), draft: None, draft_index: None, running: None,
-            page: Page::List, entry: Page::List, typing: false, capturing: false, start: 0, outputs: Vec::new(), apps: Vec::new(),
+        Self { list: profiles::load(), draft: None, draft_index: None, running: None, before_automation: None,
+            page: Page::List, entry: Page::List, typing: false, capturing: false,
+            automation: automation::State::default(), query: String::new(), select_text:false,
+            running_apps:Vec::new(), resolved_popular:BTreeMap::new(), show_popular:false, start: 0, outputs: Vec::new(), apps: Vec::new(),
             playing: Vec::new(), choices: Vec::new(), mixer: None, mixer_rows: Vec::new(),
             mixer_output: None, mixer_override: None, mixer_epoch: 0, mixer_serial: 0,
             mixer_pending: BTreeMap::new(), mixer_deferred: None, mixer_numbers: BTreeMap::new(),
@@ -66,14 +72,17 @@ impl ProfileState {
             pending_surrogate: None, registered_hotkeys: Vec::new() }
     }
     pub fn name(&self) -> Option<&str> {
-        self.running.as_ref().and_then(|running| self.list.get(running.index)).map(|p| p.name.as_str())
+        self.running.as_ref().map(|running| running.profile.name.as_str())
     }
     pub fn view(&self, available_height: f32) -> View<'_> {
         View {
-            page: self.page, list: &self.list, selected: self.running.as_ref().map(|running| running.index),
+            page: self.page, list: &self.list, selected: self.running.as_ref().and_then(|running| running.index),
             draft: self.draft.as_ref(), editing_existing: self.draft_index.is_some(), start: self.start,
             outputs: &self.outputs, apps: &self.apps, playing: &self.playing, choices: &self.choices, available_height,
             typing: self.typing, capturing: self.capturing, error: self.error, confirm_delete: self.confirm_delete,
+            query: &self.query, show_popular: self.show_popular, resolved_popular: &self.resolved_popular,
+            active_trigger: self.automation.active.and_then(|i| self.list.get(i)).and_then(|profile| profile.automation.trigger.as_ref()),
+            profile_running: self.running.is_some(),
             mixer_output: self.mixer_output.as_ref().map(|output| output.name.as_str()),
             mixer_selected: self.mixer_override.as_deref(), mixer_loading: self.mixer_loading,
             mixer_unavailable: self.mixer_unavailable, mixer_incomplete: self.mixer_incomplete,
@@ -87,6 +96,10 @@ impl ProfileState {
         self.capturing = false;
         self.pending_surrogate = None;
         self.confirm_delete = false;
+        self.select_text = false;
+        self.query.clear();
+        self.running_apps.clear();
+        self.resolved_popular.clear();
         self.choices.clear();
         self.outputs.clear();
     }
@@ -109,11 +122,14 @@ impl App {
     }
 
     fn profile_page(&mut self, page: Page) {
+        self.hide_hint();
         self.profiles.page = page;
         self.profiles.start = 0;
         self.profiles.typing = false;
         self.profiles.capturing = false;
         self.profiles.pending_surrogate = None;
+        self.profiles.select_text = false;
+        self.profiles.query.clear();
         self.profiles.confirm_delete = false;
         self.profiles.error = "";
         self.focus = None;
@@ -121,7 +137,18 @@ impl App {
         match page {
             Page::MixerOutputs => self.refresh_profile_outputs(),
             Page::Output | Page::Fallback => self.refresh_profile_outputs(),
-            Page::PickApps => self.refresh_app_choices(),
+            Page::PickApps | Page::TriggerPicker => {
+                self.profiles.show_popular = false;
+                self.profiles.resolved_popular.clear();
+                if let Some(draft) = &self.profiles.draft {
+                    let keys = if page == Page::TriggerPicker {
+                        draft.automation.trigger.iter().map(|trigger| trigger.key.as_str()).collect::<Vec<_>>()
+                    } else { draft.apps.iter().map(|app| app.key.as_str()).collect() };
+                    self.profiles.resolved_popular.extend(keys.into_iter()
+                        .filter_map(|key| app_picker::popular_index(key).map(|index| (index,key.into()))));
+                }
+                self.scan_running_apps();
+            }
             _ => (),
         }
         self.sync_mixer_watch();
@@ -140,7 +167,10 @@ impl App {
                 self.profiles.draft_index = None;
                 self.profile_page(Page::List);
             }
-            Page::Apps | Page::Output | Page::Fallback => self.profile_page(Page::Edit),
+            Page::Primary | Page::Safety | Page::Launch | Page::Apps => self.profile_page(Page::Edit),
+            Page::Output => self.profile_page(Page::Primary),
+            Page::Fallback => self.profile_page(Page::Safety),
+            Page::TriggerPicker => self.profile_page(Page::Launch),
             Page::PickApps => self.profile_page(Page::Apps),
         }
     }
@@ -164,7 +194,7 @@ impl App {
                     incomplete:self.profiles.mixer_incomplete, unavailable:self.profiles.mixer_unavailable,
                 });
             }
-            Page::PickApps => self.refresh_app_choices(),
+            Page::PickApps | Page::TriggerPicker => self.filter_catalog(),
             Page::Output | Page::Fallback => self.refresh_profile_outputs(),
             _ => (),
         }
@@ -181,6 +211,7 @@ impl App {
         let next = if delta < 0 { (self.profiles.start+1).min(max) }
             else { self.profiles.start.saturating_sub(1) };
         if next != self.profiles.start {
+            self.hide_hint();
             self.profiles.start = next;
             self.focus = None;
             self.hover = None;
@@ -223,12 +254,17 @@ impl App {
             }
             Action::ProfileName => {
                 self.profiles.typing = true;
+                self.profiles.select_text = true;
                 self.profiles.capturing = false;
                 self.profiles.error = tr("Введите имя. Enter завершает ввод.");
                 self.draw_window();
             }
             Action::ProfileSave => self.save_profile(),
             Action::ProfileDelete => self.delete_profile(),
+            Action::ProfilePreview => self.preview_profile(),
+            Action::ProfilePrimary => self.profile_page(Page::Primary),
+            Action::ProfileSafety => self.profile_page(Page::Safety),
+            Action::ProfileLaunch => self.profile_page(Page::Launch),
             Action::ProfileOutput => self.profile_page(Page::Output),
             Action::ProfileFallback => self.profile_page(Page::Fallback),
             Action::ProfileApps => self.profile_page(Page::Apps),
@@ -248,17 +284,46 @@ impl App {
             Action::ProfileOutputPick(i) => self.pick_profile_output(i),
             Action::ProfileMuteFallback => {
                 if let Some(draft) = &mut self.profiles.draft { draft.fallback = None; }
-                self.profile_page(Page::Edit);
+                self.profile_page(Page::Safety);
             }
-            Action::ProfileImportApps => self.profile_page(Page::PickApps),
-            Action::ProfileAppPick(i) => self.toggle_profile_app(i),
-            Action::ProfileRefreshApps => {
-                self.refresh_app_choices();
-                self.hover = None;
-                self.focus = None;
-                self.geometry();
+            Action::ProfileTrigger => self.profile_page(Page::TriggerPicker),
+            Action::ProfileTriggerClear => {
+                if let Some(draft) = &mut self.profiles.draft { draft.automation.trigger = None; }
+                self.profile_page(Page::Launch);
+            }
+            Action::ProfileRequireOutput | Action::ProfileAutoReturn | Action::ProfilePriority(_) => {
+                if let Some(draft) = &mut self.profiles.draft {
+                    let options = &mut draft.automation;
+                    match action {
+                        Action::ProfileRequireOutput => options.require_output = !options.require_output,
+                        Action::ProfileAutoReturn => options.restore = !options.restore,
+                        Action::ProfilePriority(step) => options.priority = (i16::from(options.priority)+i16::from(step)).clamp(1,9) as u8,
+                        _ => (),
+                    }
+                }
                 self.draw_window();
             }
+            Action::ProfileQuery => {
+                self.profiles.typing = true;
+                self.profiles.select_text = false;
+                self.draw_window();
+            }
+            Action::ProfileCopyMixer => self.copy_mixer_levels(),
+            Action::ProfileImportApps => self.profile_page(Page::PickApps),
+            Action::ProfileAppPick(i) => self.pick_application(i),
+            Action::ProfileBrowseExe => self.browse_application(),
+            Action::ProfileAppSource(popular) => {
+                self.profiles.show_popular = popular;
+                self.profiles.start = 0;
+                self.profiles.typing = false;
+                self.profiles.error = "";
+                if popular {
+                    self.filter_catalog();
+                    self.geometry();
+                    self.draw_window();
+                } else { self.refresh_running_picker(); }
+            }
+            Action::ProfileRefreshApps => self.refresh_running_picker(),
             Action::AppMute(i) => self.change_app(i, None, true),
             Action::AppForget(i) => {
                 if let Some(draft) = &mut self.profiles.draft {
@@ -286,6 +351,13 @@ impl App {
                 if let Some(draft) = &mut self.profiles.draft { draft.fallback_level = level as u8; }
                 self.draw_window();
             }
+            Action::ProfilePrimaryCap | Action::ProfileFallbackCap => {
+                if let Some(draft) = &mut self.profiles.draft {
+                    if action == Action::ProfilePrimaryCap { draft.primary_cap = level as u8; }
+                    else { draft.fallback_cap = level as u8; }
+                }
+                self.draw_window();
+            }
             Action::AppVolume(i) => self.change_app(i, Some(level), false),
             _ => (),
         }
@@ -296,6 +368,8 @@ impl App {
         match action {
             Action::ProfileMaster => draft.map(|p| p.volume.level),
             Action::ProfileFallbackLevel => draft.map(|p| p.fallback_level.into()),
+            Action::ProfilePrimaryCap => draft.map(|p| p.primary_cap.into()),
+            Action::ProfileFallbackCap => draft.map(|p| p.fallback_cap.into()),
             Action::AppVolume(i) => {
                 let apps = if self.profiles.page == Page::Apps {&draft?.apps} else {&self.profiles.apps};
                 apps.get(i).map(|app| app.volume.level)
@@ -330,11 +404,11 @@ impl App {
         let label = (1..).map(|n| format!("{} {n}",tr("Профиль"))).find(|name| {
             !self.profiles.list.iter().any(|profile| &profile.name == name)
         }).unwrap();
-        let apps = self.audio.sessions(None).map(|sessions| saved_apps(&sessions)).unwrap_or_default();
         self.profiles.draft_index = None;
         self.profiles.draft = Some(Profile {
-            name: label, output: output_data(output), volume, apps,
+            name: label, output: output_data(output), volume, apps:Vec::new(),
             fallback: None, fallback_level: 20, reconnect: true, shortcut: None,
+            primary_cap:100, fallback_cap:100, automation:profiles::Automation::default(),
         });
         self.profile_page(Page::Edit);
     }
@@ -350,73 +424,144 @@ impl App {
             }
             profile.output = output;
         }
-        self.profile_page(Page::Edit);
+        self.profile_page(if self.profiles.page == Page::Fallback {Page::Safety} else {Page::Primary});
     }
 
-    fn refresh_app_choices(&mut self) {
-        let sessions = match self.audio.sessions(None) {
-            Ok(sessions) => {
-                self.profiles.error = "";
-                sessions
-            }
-            Err(_) => {
-                self.profiles.error = tr("Микшер недоступен. Попробуй обновить список.");
-                Vec::new()
-            }
+    fn scan_running_apps(&mut self) {
+        self.profiles.running_apps = automation::applications();
+        self.filter_catalog();
+    }
+
+    pub(crate) fn refresh_running_picker(&mut self) {
+        if self.profiles.show_popular { return; }
+        self.scan_running_apps();
+        self.hover = None;
+        self.focus = None;
+        self.geometry();
+        self.draw_window();
+    }
+
+    fn filter_catalog(&mut self) {
+        let query = self.profiles.query.trim().to_lowercase();
+        self.profiles.choices = if self.profiles.show_popular {
+            app_picker::POPULAR.iter().enumerate().map(|(i,_)| Choice::Popular(i))
+                .filter(|row| matches_query(row.name(),row.path(),&query)).collect()
+        } else {
+            self.profiles.running_apps.iter().filter(|row| matches_query(&row.name,&row.key,&query))
+                .cloned().map(Choice::Running).collect()
         };
-        let mut choices = grouped(&sessions);
-        if let Some(profile) = &self.profiles.draft {
-            for app in &profile.apps {
-                if let Some(choice) = choices.iter_mut().find(|choice| choice.app.key == app.key) {
-                    choice.app = app.clone();
-                } else {
-                    choices.push(AppChoice {app: app.clone(), sessions: 0, persistent: true});
-                }
-            }
-        }
-        choices.sort_by_cached_key(|choice| choice.app.name.to_lowercase());
-        self.profiles.choices = choices;
         self.clamp_profile_scroll();
     }
 
-    fn toggle_profile_app(&mut self, index: usize) {
-        let (Some(choice),Some(profile)) = (self.profiles.choices.get(index), &mut self.profiles.draft) else { return; };
-        if !choice.persistent { return; }
-        if let Some(index) = profile.apps.iter().position(|app| app.key == choice.app.key) {
-            profile.apps.remove(index);
-        } else if profile.apps.len() < profiles::APP_LIMIT {
-            profile.apps.push(choice.app.clone());
-            profile.apps.sort_by_cached_key(|app| app.name.to_lowercase());
-        } else {
-            self.profile_error(tr("Достигнут лимит приложений профиля."));
+    fn pick_application(&mut self, index: usize) {
+        match self.profiles.choices.get(index).cloned() {
+            Some(Choice::Running(app)) => self.add_application(app,true),
+            Some(Choice::Popular(i)) => {
+                let preferred = self.profiles.resolved_popular.get(&i).map(String::as_str);
+                if let Some(app) = app_picker::locate(i,preferred,&self.profiles.running_apps) {
+                    self.profiles.resolved_popular.insert(i,app.key.clone());
+                    self.add_application(app,true);
+                } else {
+                    self.profiles.resolved_popular.remove(&i);
+                    self.profile_error(tr("Приложение не найдено. Выбери EXE вручную."));
+                }
+            }
+            None => (),
+        }
+    }
+
+    fn browse_application(&mut self) {
+        self.profiles.typing = false;
+        self.hide_hint();
+        match app_picker::select_exe(self.window.hwnd) {
+            ExeSelection::Cancelled => { self.draw_window(); }
+            ExeSelection::Invalid => self.profile_error(tr("Выбери существующий файл .exe.")),
+            ExeSelection::Failed => self.profile_error(tr("Не удалось открыть выбор файла.")),
+            ExeSelection::Selected(app) => self.add_application(app,false),
+        }
+    }
+
+    fn copy_mixer_levels(&mut self) {
+        let Ok(sessions) = self.audio.sessions(None) else {
+            self.profile_error(tr("Микшер недоступен. Попробуй обновить список."));
+            return;
+        };
+        let apps = saved_apps(&sessions);
+        if apps.is_empty() {
+            self.profile_error(tr("Запустите звук в нужном приложении."));
             return;
         }
-        self.profiles.error = "";
-        self.draw_window();
+        if let Some(draft) = &mut self.profiles.draft {
+            for app in apps {
+                if let Some(existing) = draft.apps.iter_mut().find(|r| app_picker::same_application(&r.key,&app.key)) { *existing = app; }
+                else if draft.apps.len() < profiles::APP_LIMIT { draft.apps.push(app); }
+            }
+            draft.apps.sort_by_cached_key(|row| row.name.to_lowercase());
+        }
+        self.clamp_profile_scroll();
+        self.geometry();
+        self.profile_error(tr("Текущие уровни добавлены в профиль."));
+    }
+
+    fn add_application(&mut self, app: Trigger, toggle: bool) {
+        let Some(profile) = &mut self.profiles.draft else { return; };
+        if self.profiles.page == Page::TriggerPicker {
+            profile.automation.trigger = Some(app);
+            self.profile_page(Page::Launch);
+            return;
+        }
+        let message = if let Some(index) = profile.apps.iter().position(|row| app_picker::same_application(&row.key,&app.key)) {
+            if toggle {
+                profile.apps.remove(index);
+                ""
+            } else { tr("Приложение уже добавлено.") }
+        } else if profile.apps.len() < profiles::APP_LIMIT {
+            profile.apps.push(AppLevel {key:app.key,name:app.name,volume:Volume {level:100,muted:false}});
+            profile.apps.sort_by_cached_key(|row| row.name.to_lowercase());
+            tr("Приложение добавлено.")
+        } else { tr("Достигнут лимит приложений профиля.") };
+        self.profile_error(message);
     }
 
     pub(crate) fn profile_char(&mut self, code: u16) {
         if !self.profiles.typing { return; }
-        let Some(draft) = &mut self.profiles.draft else { return; };
+        let search = self.profiles.page.is_app_picker();
+        if code == 13 {
+            self.profiles.typing = false;
+            self.profiles.select_text = false;
+            self.profiles.pending_surrogate = None;
+            self.profiles.error = "";
+            self.draw_window();
+            return;
+        }
+        let text = if search { &mut self.profiles.query }
+            else if let Some(draft) = &mut self.profiles.draft { &mut draft.name }
+            else { return; };
         match code {
-            8 => { self.profiles.pending_surrogate = None; draft.name.pop(); }
-            13 => {
-                self.profiles.typing = false;
+            8 => {
                 self.profiles.pending_surrogate = None;
-                self.profiles.error = "";
+                if core::mem::take(&mut self.profiles.select_text) { text.clear(); }
+                else { text.pop(); }
             }
+            1 => self.profiles.select_text = true,
             0xD800..=0xDBFF => self.profiles.pending_surrogate = Some(code),
-            _ if draft.name.chars().count() < 40 => {
+            _ => {
                 let mut pair = [code,0];
                 let units = if let Some(high) = self.profiles.pending_surrogate.take() {
                     pair = [high,code];
                     &pair[..]
                 } else { &pair[..1] };
                 for value in char::decode_utf16(units.iter().copied()).flatten() {
-                    if !value.is_control() { draft.name.push(value); }
+                    if value.is_control() { continue; }
+                    if core::mem::take(&mut self.profiles.select_text) { text.clear(); }
+                    if text.chars().count() < 60 { text.push(value); }
                 }
             }
-            _ => (),
+        }
+        if search {
+            self.profiles.start = 0;
+            self.filter_catalog();
+            self.geometry();
         }
         self.draw_window();
     }
@@ -493,9 +638,10 @@ impl App {
         }
         self.profiles.list = next;
         self.sync_profile_hotkeys();
-        if index.is_some() && index == self.profiles.running.as_ref().map(|running| running.index) {
+        if index.is_some() && index == self.profiles.running.as_ref().and_then(|running| running.index) {
             self.deactivate_profile();
         }
+        self.sync_automation_timer();
         self.profiles.draft = None;
         self.profiles.draft_index = None;
         self.profile_page(Page::List);
@@ -516,10 +662,21 @@ impl App {
         }
         self.profiles.list = next;
         self.sync_profile_hotkeys();
-        if let Some(running) = &mut self.profiles.running {
-            if running.index == index { self.deactivate_profile(); }
-            else if running.index > index { running.index -= 1; }
+        if self.profiles.running.as_ref().and_then(|running| running.index) == Some(index) {
+            self.deactivate_profile();
+        } else {
+            if let Some(running) = &mut self.profiles.running {
+                if let Some(i) = &mut running.index { if *i > index { *i -= 1; } }
+            }
+            if let Some(i) = &mut self.profiles.automation.active { if *i > index { *i -= 1; } }
         }
+        if let Some(previous) = &mut self.profiles.before_automation {
+            if previous.index == Some(index) {
+                self.profiles.before_automation = None;
+            } else if let Some(i) = &mut previous.index { if *i > index { *i -= 1; } }
+        }
+        self.profiles.automation.last_failed = None;
+        self.sync_automation_timer();
         self.profile_back();
     }
 
@@ -530,7 +687,8 @@ impl App {
 
     fn activate_profile(&mut self, index: usize) {
         let Some(profile) = self.profiles.list.get(index).cloned() else { return; };
-        if self.route_profile(index, &profile, true) {
+        if self.route_profile(Some(index), &profile, true) {
+            self.cancel_automation();
             let status = if self.profiles.running.as_ref().is_some_and(|running| running.degraded) {
                 tr("Профиль применён с запасным режимом")
             } else { tr("Профиль применён") };
@@ -542,35 +700,55 @@ impl App {
         }
     }
 
-    fn route_profile(&mut self, index: usize, profile: &Profile, allow_primary: bool) -> bool {
+    fn preview_profile(&mut self) {
+        let Some(profile) = self.profiles.draft.clone() else {return;};
+        if self.route_profile(None,&profile,true) {
+            self.cancel_automation();
+            self.profile_error(tr("Профиль применён для проверки."));
+        } else { self.profile_error(tr("Не удалось применить профиль.")); }
+    }
+
+    fn route_profile(&mut self, index: Option<usize>, profile: &Profile, allow_primary: bool) -> bool {
         let Ok(devices) = self.audio.devices() else { return false; };
         let connected = |id: &str| devices.iter().any(|device| same(&device.id,id));
-        let (target, level, degraded) = if allow_primary && connected(&profile.output.id) {
-            (Some(&profile.output), profile.volume, false)
-        } else {
-            (profile.fallback.as_ref().filter(|device| connected(&device.id)),
-                Volume { level: profile.fallback_level.into(), muted: profile.volume.muted }, true)
-        };
+        let (target,level,degraded) = automation::route(profile,allow_primary,connected);
+        let previous_plan = self.profiles.mixer.as_ref().and_then(mixer::Worker::pause_plan);
         let mut seen = BTreeSet::new();
-        let output = if let Some(target) = target {
-            restore_apps(&mut self.audio, &target.id, &profile.apps, &mut seen);
-            if !matches!(self.audio.select_with_volume(&target.id, Some(level)), Ok(true)) {
-                return false;
+        let routed = if let Some(target) = target {
+            let mut rollback = Vec::new();
+            restore_apps(&mut self.audio, &target.id, &profile.apps, &mut seen, Some(&mut rollback));
+            if matches!(self.audio.select_with_volume(&target.id, Some(level)), Ok(true)) {
+                restore_apps(&mut self.audio, &target.id, &profile.apps, &mut seen, None);
+                Ok(Some(target.id.clone()))
+            } else {
+                for (session, previous) in rollback {
+                    session.set(Some(previous.level), Some(previous.muted));
+                }
+                Err(())
             }
-            restore_apps(&mut self.audio, &target.id, &profile.apps, &mut seen);
-            Some(target.id.clone())
         } else {
-            let current = self.audio.default_id(1).ok().flatten();
-            if current.is_some() && self.audio.mute_output().is_err() { return false; }
-            current
+            self.audio.default_id(1).map_err(|_| ()).and_then(|current| {
+                let current = current.filter(|id| connected(id));
+                if current.is_some() { self.audio.mute_output().map_err(|_| ())?; }
+                Ok(current)
+            })
         };
-        self.profiles.running = Some(Running { index, output, degraded, apps_allowed: target.is_some() });
+        let Ok(output) = routed else {
+            if let Some(worker) = &self.profiles.mixer { worker.plan(previous_plan); }
+            return false;
+        };
+        self.profiles.running = Some(Running { index, profile:profile.clone(), output, degraded, apps_allowed: target.is_some() });
         self.refresh_volume();
         self.sync_mixer_plan(seen);
         true
     }
 
     pub(crate) fn deactivate_profile(&mut self) {
+        self.cancel_automation();
+        self.clear_running_profile();
+    }
+
+    fn clear_running_profile(&mut self) {
         self.profiles.running = None;
         self.sync_mixer_plan(BTreeSet::new());
     }
@@ -578,22 +756,23 @@ impl App {
     pub(crate) fn profile_endpoint_changed(&mut self) {
         if let Some(running) = &self.profiles.running {
             let index = running.index;
-            let profile = self.profiles.list[index].clone();
+            let profile = running.profile.clone();
             if let (Ok(current), Ok(devices)) = (self.audio.default_id(1),self.audio.devices()) {
                 let connected = |id: &str| devices.iter().any(|device| same(&device.id,id));
                 let unchanged = same_output(current.as_deref(),running.output.as_deref());
-                let primary = connected(&profile.output.id);
-                let recovered = running.degraded && primary && profile.reconnect;
-                let needed = (!primary && !running.degraded) || recovered
-                    || (!unchanged && running.degraded && !running.output.as_ref().is_some_and(|id| connected(id)));
-                if needed {
-                    if !self.route_profile(index,&profile,!running.degraded || recovered) {
-                        let _ = self.audio.mute_output();
-                        self.deactivate_profile();
-                        self.notify(tr("Не удалось восстановить выход"), &profile.name);
+                let route_connected = running.output.as_ref().is_some_and(|id| connected(id));
+                let action = automation::endpoint_action(&profile,running.degraded,running.apps_allowed,
+                    unchanged,route_connected,connected);
+                match action {
+                    automation::EndpointAction::Apply {allow_primary} => {
+                        if !self.route_profile(index,&profile,allow_primary) {
+                            let _ = self.audio.mute_output();
+                            self.deactivate_profile();
+                            self.notify(tr("Не удалось восстановить выход"), &profile.name);
+                        }
                     }
-                } else if !unchanged {
-                    self.deactivate_profile();
+                    automation::EndpointAction::ManualOverride => self.deactivate_profile(),
+                    automation::EndpointAction::Stay => (),
                 }
             }
         }
@@ -604,6 +783,144 @@ impl App {
         if self.mixer_visible() {
             self.sync_mixer_watch();
             if let Some(worker) = &self.profiles.mixer { worker.reconcile(); }
+        }
+    }
+
+    pub(crate) fn profile_cap(&self) -> i32 {
+        self.profiles.running.as_ref().filter(|running| running.apps_allowed).map_or(100,|running| {
+            if running.degraded { running.profile.fallback_cap.into() } else { running.profile.primary_cap.into() }
+        })
+    }
+
+    pub(crate) fn cap_applies_to_current_output(&mut self) -> bool {
+        let Some(id) = self.profiles.running.as_ref().and_then(|r| r.output.as_deref()) else {return false;};
+        self.audio.default_id(1).ok().flatten().is_some_and(|current| same(id,&current))
+    }
+
+    pub(crate) fn sync_automation_timer(&mut self) {
+        let watch = self.profiles.list.iter().any(|p| p.automation.trigger.is_some());
+        if self.profiles.automation.watching != watch {
+            unsafe {
+                if watch {
+                    self.profiles.automation.watching = SetTimer(self.host,automation::TIMER,automation::INTERVAL,None) != 0;
+                } else {
+                    KillTimer(self.host,automation::TIMER);
+                    self.profiles.automation.watching = false;
+                }
+            }
+        }
+    }
+
+    fn cancel_automation(&mut self) {
+        self.profiles.before_automation = None;
+        let state = &mut self.profiles.automation;
+        state.active = None;
+        state.baseline = None;
+        state.restore_pending = None;
+        state.last_failed = None;
+        if state.watching {
+            if let Some(running) = automation::running(&self.profiles.list) {
+                state.suppressed.extend(running);
+            }
+        }
+    }
+
+    pub(crate) fn automation_tick(&mut self) {
+        if self.pressed.is_some() { return; }
+        let Some(mut running) = automation::running(&self.profiles.list) else {return;};
+        automation::discard_suppressed(&mut running,&mut self.profiles.automation.suppressed);
+        let old = self.profiles.automation.active;
+        let needs_outputs = self.profiles.list.iter().enumerate().any(|(i,profile)| {
+            Some(i) != old && profile.automation.require_output
+                && profile.automation.trigger.as_ref().is_some_and(|trigger| running.contains_key(&trigger.key))
+        });
+        let connected = if needs_outputs {
+            let Ok(devices) = self.audio.devices() else { return; };
+            devices
+        } else { Vec::new() };
+        let winner = automation::best(&self.profiles.list,&running,old,
+            |id| connected.iter().any(|output| same(id,&output.id)));
+        if old == winner {
+            if winner.is_none() {
+                self.profiles.automation.last_failed = None;
+                self.retry_baseline_sessions();
+            }
+            return;
+        }
+        if let Some(index) = winner {
+            let previously_failed = self.profiles.automation.last_failed == Some(index);
+            if previously_failed && self.profiles.automation.retry_after > 0 {
+                self.profiles.automation.retry_after -= 1;
+                return;
+            }
+            self.profiles.automation.restore_pending = None;
+            let profile = self.profiles.list[index].clone();
+            let baseline = if old.is_none() { self.capture_baseline() } else {None};
+            if profile.automation.restore && old.is_none() && baseline.is_none() {
+                self.profiles.automation.last_failed = Some(index);
+                self.profiles.automation.retry_after = 4;
+                if !previously_failed { self.notify(tr("Не удалось запомнить прежний звук"),&profile.name); }
+                return;
+            }
+            let before = old.is_none().then(|| self.profiles.running.clone()).flatten();
+            if self.route_profile(Some(index),&profile,true) {
+                self.profiles.automation.active = Some(index);
+                self.profiles.automation.last_failed = None;
+                if old.is_none() {
+                    self.profiles.automation.baseline = baseline;
+                    self.profiles.before_automation = before;
+                }
+                let trigger = profile.automation.trigger.as_ref().map_or("",|trigger| trigger.name.as_str());
+                self.notify(tr("Профиль включился автоматически"),&alloc::format!("{} · {trigger}",profile.name));
+                self.draw_window();
+            } else {
+                self.profiles.automation.last_failed = Some(index);
+                self.profiles.automation.retry_after = 4;
+                if !previously_failed { self.notify(tr("Не удалось применить профиль."),&profile.name); }
+            }
+        } else if let Some(index) = old {
+            self.profiles.automation.active = None;
+            self.profiles.automation.last_failed = None;
+            let restore = self.profiles.list.get(index).is_some_and(|profile| profile.automation.restore);
+            let baseline = self.profiles.automation.baseline.take();
+            let previous = self.profiles.before_automation.take();
+            self.clear_running_profile();
+            if let Some(mut baseline) = baseline.filter(|_| restore) {
+                if matches!(self.audio.select_with_volume(&baseline.output.id,Some(baseline.volume)),Ok(true)) {
+                    restore_baseline_sessions(&mut self.audio,&mut baseline);
+                    self.profiles.running = previous.filter(|previous| previous.output.as_deref()
+                        .is_some_and(|id| same(id,&baseline.output.id)));
+                    let name = self.profiles.running.as_ref()
+                        .map_or_else(|| baseline.output.name.clone(),|running| running.profile.name.clone());
+                    if self.profiles.running.is_some() {
+                        self.sync_mixer_plan(baseline.restored);
+                    } else {
+                        self.profiles.automation.restore_pending = Some((baseline,2));
+                    }
+                    self.notify(tr("Прежний звук восстановлен"),&name);
+                } else { self.notify(tr("Прежний выход недоступен"),&baseline.output.name); }
+            }
+            if self.kind == WindowKind::Popup { self.refresh_devices(); } else {self.refresh_volume();}
+            self.draw_window();
+        }
+    }
+
+    fn capture_baseline(&mut self) -> Option<automation::Baseline> {
+        let devices = self.audio.devices().ok()?;
+        let output = output_data(devices.iter().find(|d| d.selected)?);
+        let volume = self.audio.volume_at(&output.id).ok()?;
+        let sessions = self.audio.sessions(Some(&output.id)).ok()?.into_iter().map(|session| automation::SavedSession {
+            instance:session.instance,key:session.value.key,volume:session.value.volume,
+        }).collect();
+        self.audio.default_id(1).ok().flatten().filter(|current| same(current,&output.id))?;
+        Some(automation::Baseline {output,volume,sessions,restored:BTreeSet::new()})
+    }
+
+    fn retry_baseline_sessions(&mut self) {
+        let Some((mut baseline,attempts)) = self.profiles.automation.restore_pending.take() else {return;};
+        if self.audio.default_id(1).ok().flatten().is_some_and(|id| same(&id,&baseline.output.id)) {
+            restore_baseline_sessions(&mut self.audio,&mut baseline);
+            if attempts > 1 { self.profiles.automation.restore_pending = Some((baseline,attempts-1)); }
         }
     }
 }
@@ -686,7 +1003,7 @@ impl App {
 
     fn sync_mixer_plan(&mut self, seen: BTreeSet<String>) {
         let plan = self.profiles.running.as_ref().and_then(|running| {
-            let profile = &self.profiles.list[running.index];
+            let profile = &running.profile;
             if !running.apps_allowed || profile.apps.is_empty() { return None; }
             Some(mixer::Plan {output:running.output.clone()?,apps:profile.apps.clone(),seen})
         });
@@ -835,38 +1152,60 @@ impl App {
 }
 
 fn same(a: &str, b: &str) -> bool { a.eq_ignore_ascii_case(b) }
+pub(crate) fn restore_baseline_sessions(audio: &mut crate::audio::Audio, baseline: &mut automation::Baseline) {
+    if let Ok(sessions) = audio.sessions(Some(&baseline.output.id)) {
+        for session in sessions {
+            if baseline.restored.contains(&session.instance) { continue; }
+            let saved = baseline.sessions.iter().find(|r| r.instance == session.instance).or_else(|| {
+                if session.value.key.starts_with("pid:") {return None;}
+                let mut matches = baseline.sessions.iter()
+                    .filter(|row| app_picker::same_application(&row.key,&session.value.key));
+                matches.next().filter(|_| matches.next().is_none())
+            });
+            if saved.is_some_and(|saved| saved.volume == session.value.volume
+                || session.set(Some(saved.volume.level),Some(saved.volume.muted))) {
+                baseline.restored.insert(session.instance);
+            }
+        }
+    }
+}
+fn matches_query(name: &str, key: &str, query: &str) -> bool {
+    query.is_empty() || name.to_lowercase().contains(query) || key.to_lowercase().contains(query)
+}
 fn same_output(a: Option<&str>, b: Option<&str>) -> bool {
     match (a,b) { (Some(a),Some(b)) => same(a,b), _ => a == b }
 }
 fn output_data(device: &Device) -> Output { Output { id: device.id.clone(), name: device.name.clone() } }
 
-fn grouped(sessions: &[Session]) -> Vec<AppChoice> {
-    let mut values = BTreeMap::new();
-    for session in sessions {
-        let (status,count) = values.entry(session.value.key.as_str()).or_insert((session,0));
-        if session.active && !status.active { *status = session; }
-        *count += 1;
+fn saved_apps(sessions: &[Session]) -> Vec<AppLevel> {
+    let mut values = BTreeMap::<_, &Session>::new();
+    for session in sessions.iter().filter(|row| !row.value.key.starts_with("pid:")) {
+        let best = values.entry(session.value.key.as_str()).or_insert(session);
+        if session.active && !best.active { *best = session; }
     }
     let mut rows: Vec<_> = values.into_values().collect();
-    rows.sort_by_cached_key(|(row,_)| row.value.name.to_lowercase());
-    rows.into_iter().map(|(row,sessions)| AppChoice {
-        app: row.value.clone(),sessions,persistent: !row.value.key.starts_with("pid:"),
-    }).collect()
+    rows.sort_by_cached_key(|row| row.value.name.to_lowercase());
+    rows.into_iter().take(profiles::APP_LIMIT).map(|row| row.value.clone()).collect()
 }
 
-fn saved_apps(sessions: &[Session]) -> Vec<AppLevel> {
-    grouped(sessions).into_iter().filter(|choice| choice.persistent).take(profiles::APP_LIMIT).map(|choice| choice.app).collect()
-}
-
-fn restore_apps(audio: &mut crate::audio::Audio, output: &str, apps: &[AppLevel], seen: &mut BTreeSet<String>) {
+pub(crate) fn restore_apps(audio: &mut crate::audio::Audio, output: &str, apps: &[AppLevel], seen: &mut BTreeSet<String>,
+    mut rollback: Option<&mut Vec<(Session,Volume)>>) {
     if apps.is_empty() { return; }
     let Ok(sessions) = audio.sessions(Some(output)) else { return };
     let mut present = BTreeSet::new();
     for session in sessions {
-        let Some(saved) = apps.iter().find(|app| app.key == session.value.key) else { continue; };
-        if seen.contains(&session.instance) || session.value.volume == saved.volume
-            || session.set(Some(saved.volume.level),Some(saved.volume.muted)) {
+        let Some(saved) = apps.iter().find(|app| app.key == session.value.key)
+            .or_else(|| apps.iter().find(|app| app_picker::controls_session(&app.key,&session.value.key))) else { continue; };
+        let previous = session.value.volume;
+        if seen.contains(&session.instance) || previous == saved.volume {
             present.insert(session.instance);
+            continue;
+        }
+        if session.set(Some(saved.volume.level),Some(saved.volume.muted)) {
+            present.insert(session.instance.clone());
+        }
+        if let Some(rollback) = rollback.as_deref_mut() {
+            rollback.push((session,previous));
         }
     }
     *seen = present;

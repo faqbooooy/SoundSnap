@@ -334,7 +334,7 @@ impl Painter {
         }
         self.paint_path(&path, 2.25 * scale, color);
     }
-    fn setup_text(&self, size: f32, bold: bool, align: i32) -> (*mut GpFont, *mut GpStringFormat) {
+    fn setup_text(&self, size: f32, bold: bool, align: i32, wrap: bool) -> (*mut GpFont, *mut GpStringFormat) {
         let mut font = null_mut();
         let mut format = null_mut();
         unsafe {
@@ -344,7 +344,7 @@ impl Painter {
             if GdipCreateFont(family, size, i32::from(bold && !semibold), UnitPixel, &mut font) != 0 {
                 GdipCreateFont(pair.regular, size, 0, UnitPixel, &mut font);
             }
-            GdipCreateStringFormat(StringFormatFlagsNoWrap, 0, &mut format);
+            GdipCreateStringFormat(if wrap { 0 } else { StringFormatFlagsNoWrap }, 0, &mut format);
             GdipSetStringFormatAlign(format, align);
             GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
             GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
@@ -352,8 +352,14 @@ impl Painter {
         (font, format)
     }
     pub fn text(&self, text: &str, r: RectF, size: f32, bold: bool, align: i32, color: Color) {
+        self.draw_text(text, r, size, bold, align, color, false);
+    }
+    pub fn wrapped_text(&self, text: &str, r: RectF, size: f32, color: Color) {
+        self.draw_text(text, r, size, false, StringAlignmentNear, color, true);
+    }
+    fn draw_text(&self, text: &str, r: RectF, size: f32, bold: bool, align: i32, color: Color, wrap: bool) {
         let s = wide(text);
-        let (font, format) = self.setup_text(size, bold, align);
+        let (font, format) = self.setup_text(size, bold, align, wrap);
         unsafe {
             let mut brush = null_mut();
             if !font.is_null() && GdipCreateSolidFill(color, &mut brush) == 0 {

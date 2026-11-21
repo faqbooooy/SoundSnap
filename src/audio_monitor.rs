@@ -90,7 +90,11 @@ impl SessionMonitor {
                     }
                 }
                 match tracked.session.sample() {
-                    Ok(true) => { tracked.readable = true; true }
+                    Ok(true) => {
+                        tracked.readable = true;
+                        if reconcile { tracked.session.refresh_process_identity(); }
+                        true
+                    }
                     Ok(false) => { unsubscribe(tracked,&self.events); false }
                     Err(_) => { tracked.readable = false; true }
                 }

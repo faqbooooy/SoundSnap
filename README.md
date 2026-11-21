@@ -28,7 +28,11 @@ SoundSnap remembers the volume for each output. When switching through the app, 
 
 Open **Mixer** from the main panel or the tray menu to adjust or mute individual audio sessions. By default it follows the Windows output. Click **Output** in the mixer to view sessions on another connected device. Apps such as Discord can have more than one session, so they may have separate sliders.
 
-Choose **Profiles → Create profile** to start with your current audio settings. Give it a name, choose the apps it should control, and adjust their levels or mute states. Each profile can have a shortcut, a backup output with its own volume, or a mute option when the main output disconnects. You can also choose whether to return to the main output when it reconnects.
+Choose **Profiles → New profile** to start with your current output and master volume. Click a profile tile to activate it or use the pencil to edit. **Apply now** previews the profile without saving it.
+
+The editor has four sections: primary output, applications, disconnection, and activation. Use **Running**, **Popular**, or **Choose EXE** to add an app. **Popular** checks your PC for a matching executable. Use **Copy mixer levels** to import current volume and mute states. Set separate volume limits for your primary and backup outputs, or mute audio if the primary device disconnects.
+
+In **Profile activation**, you can set a keyboard shortcut or choose an app from the same picker to activate the profile while it runs. You can require the primary output to be connected. When multiple rules match, the profile with the highest priority wins. Enable **Restore previous audio** to return to your previous output and levels when the last applicable rule ends. Manually switching outputs or profiles overrides automation for apps already running.
 
 Profile rules apply at the app level. If an app has multiple audio sessions, the profile applies the same level to all of them.
 

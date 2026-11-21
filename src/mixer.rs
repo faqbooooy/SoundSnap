@@ -37,7 +37,6 @@ pub struct Applied { pub epoch: u64, pub instance: String, pub serial: u64, pub 
 #[derive(Default)]
 struct Incoming {
     watch: Option<Option<Watch>>,
-    plan: Option<Option<Plan>>,
     writes: BTreeMap<String,Change>,
     reconcile: bool,
 }
@@ -50,6 +49,7 @@ pub struct Updates {
 struct Shared {
     wake: Arc<Signal>,
     input: Lock<Incoming>,
+    plan: Lock<Option<Plan>>,
     output: Lock<Updates>,
     stop: AtomicBool,
 }
@@ -60,7 +60,7 @@ impl Worker {
     pub fn start(host: HWND) -> Option<Self> {
         let shared = Arc::new(Shared {
             wake: Arc::new(Signal::new()?), input: Lock::new(Incoming::default()),
-            output: Lock::new(Updates::default()), stop: AtomicBool::new(false),
+            plan: Lock::new(None), output: Lock::new(Updates::default()), stop: AtomicBool::new(false),
         });
         let state = Box::into_raw(Box::new(Start { shared: shared.clone(),host:host as usize }));
         let thread = unsafe { CreateThread(null(),0,Some(run),state.cast(),0,null_mut()) };
@@ -78,8 +78,11 @@ impl Worker {
         self.shared.wake.wake();
     }
     pub fn plan(&self, plan: Option<Plan>) {
-        self.shared.input.with(|i| i.plan = Some(plan));
+        self.shared.plan.with(|current| *current = plan);
         self.shared.wake.wake();
+    }
+    pub fn pause_plan(&self) -> Option<Plan> {
+        self.shared.plan.with(Option::take)
     }
     pub fn reconcile(&self) {
         self.shared.input.with(|i| i.reconcile = true);
@@ -124,14 +127,13 @@ fn worker_loop(host: HWND, shared: &Shared, initialized: bool) {
     let mut audio = Audio::default();
     let mut monitors = BTreeMap::<String,SessionMonitor>::new();
     let mut watch = None::<Watch>;
-    let mut plan = None::<Plan>;
     let mut pending = BTreeMap::<String,Change>::new();
     let mut last_snapshot = None;
     let mut last_write = None::<u64>;
     let mut last_scan = motion::now();
     loop {
         let now = motion::now();
-        let until_scan = if watch.is_none() && plan.is_none() { INFINITE }
+        let until_scan = if watch.is_none() && shared.plan.with(|plan| plan.is_none()) { INFINITE }
             else { RECONCILE_MS.saturating_sub(now.saturating_sub(last_scan) as u32) };
         let until_write = if pending.is_empty() { INFINITE } else {
             last_write.map_or(0,|time| WRITE_INTERVAL_MS.saturating_sub(now.saturating_sub(time)) as u32)
@@ -148,12 +150,12 @@ fn worker_loop(host: HWND, shared: &Shared, initialized: bool) {
             last_snapshot = None;
             last_write = None;
         }
-        if let Some(next) = incoming.plan { plan = next; }
         for change in incoming.writes.into_values() {
             if watch.as_ref().is_some_and(|target| target.epoch == change.epoch) { merge(&mut pending,change); }
         }
         let mixer_output = watch.as_ref().map(|watch| watch.output.as_str());
-        let profile_output = plan.as_ref().map(|plan| plan.output.as_str());
+        let profile_output = shared.plan.with(|plan| plan.as_ref().map(|plan| plan.output.clone()));
+        let profile_output = profile_output.as_deref();
         monitors.retain(|id,_| mixer_output == Some(id.as_str()) || profile_output == Some(id.as_str()));
         if initialized {
             for id in [mixer_output,profile_output].into_iter().flatten() {
@@ -165,9 +167,13 @@ fn worker_loop(host: HWND, shared: &Shared, initialized: bool) {
             }
             monitors.retain(|_,monitor| monitor.refresh(reconcile).is_ok());
         }
-        if let Some(profile) = &mut plan {
-            if let Some(monitor) = monitors.get_mut(&profile.output) { apply_plan(&mut audio,monitor,profile); }
-        }
+        shared.plan.with(|plan| {
+            if let Some(profile) = plan {
+                if let Some(monitor) = monitors.get_mut(&profile.output) {
+                    apply_plan(&mut audio,monitor,profile);
+                }
+            }
+        });
         let mut applied = Vec::new();
         let ready = last_write.is_none_or(|time| now.saturating_sub(time) >= WRITE_INTERVAL_MS);
         if !pending.is_empty() && (ready || pending.values().any(|change| change.final_value)) {
@@ -207,7 +213,9 @@ fn apply_plan(audio: &mut Audio, monitor: &mut SessionMonitor, plan: &mut Plan) 
     let mut present = BTreeSet::new();
     let mut writes = Vec::new();
     for session in monitor.rows() {
-        let Some(saved) = plan.apps.iter().find(|app| app.key == session.value.key) else { continue; };
+        let Some(saved) = plan.apps.iter().find(|app| app.key == session.value.key).or_else(|| {
+            plan.apps.iter().find(|app| crate::app_picker::controls_session(&app.key,&session.value.key))
+        }) else { continue; };
         if plan.seen.contains(&session.instance) || session.value.volume == saved.volume {
             present.insert(session.instance.clone());
         } else { writes.push((session.instance.clone(),saved.volume)); }

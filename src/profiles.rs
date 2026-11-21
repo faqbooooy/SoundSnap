@@ -36,6 +36,28 @@ pub struct Profile {
     pub fallback_level: u8,
     pub reconnect: bool,
     pub shortcut: Option<Shortcut>,
+    pub primary_cap: u8,
+    pub fallback_cap: u8,
+    pub automation: Automation,
+}
+
+#[derive(Clone)]
+pub struct Trigger {
+    pub key: String,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct Automation {
+    pub trigger: Option<Trigger>,
+    pub require_output: bool,
+    pub restore: bool,
+    pub priority: u8,
+}
+impl Default for Automation {
+    fn default() -> Self {
+        Self {trigger:None,require_output:true,restore:true,priority:5}
+    }
 }
 
 pub fn load() -> Vec<Profile> {
@@ -44,7 +66,11 @@ pub fn load() -> Vec<Profile> {
 }
 
 pub fn save(profiles: &[Profile]) -> bool {
-    let mut data = b"SSP1".to_vec();
+    runtime::write_data(FILE, "\\profiles.tmp", &encode(profiles))
+}
+
+pub(crate) fn encode(profiles: &[Profile]) -> Vec<u8> {
+    let mut data = b"SSP2".to_vec();
     data.push(profiles.len() as u8);
     for profile in profiles {
         put_string(&mut data, &profile.name);
@@ -62,8 +88,15 @@ pub fn save(profiles: &[Profile]) -> bool {
             put_string(&mut data, &app.name);
             put_volume(&mut data, app.volume);
         }
+        data.extend([profile.primary_cap,profile.fallback_cap,profile.automation.priority,
+            u8::from(profile.automation.require_output),u8::from(profile.automation.restore),
+            u8::from(profile.automation.trigger.is_some())]);
+        if let Some(trigger) = &profile.automation.trigger {
+            put_string(&mut data,&trigger.key);
+            put_string(&mut data,&trigger.name);
+        }
     }
-    runtime::write_data(FILE, "\\profiles.tmp", &data)
+    data
 }
 
 fn put_string(data: &mut Vec<u8>, text: &str) {
@@ -80,8 +113,9 @@ fn put_volume(data: &mut Vec<u8>, volume: Volume) {
     data.extend([volume.level.clamp(0, 100) as u8, u8::from(volume.muted)]);
 }
 
-fn decode(data: &[u8]) -> Option<Vec<Profile>> {
-    let mut read = Reader(data.strip_prefix(b"SSP1")?);
+pub(crate) fn decode(data: &[u8]) -> Option<Vec<Profile>> {
+    let legacy = data.starts_with(b"SSP1");
+    let mut read = Reader(if legacy {data.strip_prefix(b"SSP1")?} else {data.strip_prefix(b"SSP2")?});
     let count = read.byte()? as usize;
     if count > LIMIT { return None; }
     let mut profiles = Vec::with_capacity(count);
@@ -102,7 +136,18 @@ fn decode(data: &[u8]) -> Option<Vec<Profile>> {
         for _ in 0..count {
             apps.push(AppLevel { key: read.string()?, name: read.string()?, volume: read.volume()? });
         }
-        profiles.push(Profile { name, output, volume, apps, fallback, fallback_level, reconnect, shortcut });
+        let (primary_cap,fallback_cap,automation) = if legacy { (100,100,Automation::default()) } else {
+            let primary_cap = read.level()?;
+            let fallback_cap = read.level()?;
+            let priority = read.byte()?;
+            if !(1..=9).contains(&priority) { return None; }
+            let require_output = read.flag()?;
+            let restore = read.flag()?;
+            let trigger = if read.flag()? {Some(Trigger {key:read.string()?,name:read.string()?})} else {None};
+            (primary_cap,fallback_cap,Automation {trigger,require_output,restore,priority})
+        };
+        profiles.push(Profile { name, output, volume, apps, fallback, fallback_level, reconnect, shortcut,
+            primary_cap,fallback_cap,automation });
     }
     read.0.is_empty().then_some(profiles)
 }

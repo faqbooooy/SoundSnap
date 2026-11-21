@@ -98,6 +98,16 @@ impl Session {
         self.value.volume = session_volume(&self.interface)?;
         Ok(true)
     }
+    fn refresh_process_identity(&mut self) {
+        if !self.active { return; }
+        let Some(pid) = self.value.key.strip_prefix("pid:").and_then(|value| value.parse::<u32>().ok()) else { return; };
+        let Some(path) = process_path(pid) else { return; };
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        if self.value.name == format!("{} · {pid}",tr("Приложение")) {
+            self.value.name = readable_process_name(file);
+        }
+        self.value.key = crate::app_picker::path_key(&path);
+    }
     pub fn set(&self, level: Option<i32>, muted: Option<bool>) -> bool {
         let interface = self.interface.0;
         let mute = |value| checked(unsafe { call!(interface, 5, [i32, *const GUID] [i32::from(value), &OWN_VOLUME], i32) }).is_ok();
@@ -185,29 +195,37 @@ impl Audio {
         }
         let saved = volume.map(|volume| volume.level.clamp(0,100) as f32 / 100.)
             .or_else(|| settings::device_volume(target));
-        if let Some(saved) = saved {
+        let prepared = if let Some(saved) = saved {
             let device = self.device_by_id(target)?;
             let endpoint = activate_volume(&device)?;
-            if volume.is_some_and(|volume| volume.muted) { set_mute(endpoint.0, true)?; }
-            // Prepare the target before changing any default role.
-            if volume_scalar(endpoint.0)? != saved {
-                set_scalar(endpoint.0, saved)?;
+            let original = (volume_scalar(endpoint.0)?, endpoint_muted(endpoint.0)?);
+            let mute = volume.map_or(original.1,|volume| volume.muted);
+            let change = set_endpoint_state(endpoint.0, saved, mute, original);
+            if let Err(error) = change {
+                restore_endpoint_state(endpoint.0, original);
+                return Err(error);
             }
-            if volume.is_some_and(|volume| !volume.muted) { set_mute(endpoint.0, false)?; }
-        }
-        for (index, role) in roles.into_iter().enumerate() {
-            if previous[index].as_ref().is_some_and(|old| old.eq_ignore_ascii_case(target)) { continue }
-            let result = unsafe { call!(policy.0, 13, [*const u16, i32] [encoded.as_ptr(), role], i32) };
-            if result < 0 {
-                for (role, old) in roles[..index].iter().copied().zip(&previous).rev() {
-                    if let Some(old) = old.as_ref().filter(|old| !old.eq_ignore_ascii_case(target)) {
-                        unsafe { call!(policy.0, 13, [*const u16, i32] [wide(old).as_ptr(), role], i32); }
-                    }
+            Some((endpoint,original))
+        } else { None };
+        let mut changed = 0u8;
+        let selected = (|| {
+            for (index, role) in roles.into_iter().enumerate() {
+                if previous[index].as_ref().is_some_and(|old| old.eq_ignore_ascii_case(target)) { continue; }
+                checked(unsafe { call!(policy.0, 13, [*const u16, i32] [encoded.as_ptr(), role], i32) })?;
+                changed |= 1 << index;
+            }
+            Ok(self.default_id(MULTIMEDIA)?.is_some_and(|id| id.eq_ignore_ascii_case(target)))
+        })();
+        if selected != Ok(true) {
+            for (index, role) in roles.into_iter().enumerate().rev() {
+                if changed & (1 << index) == 0 { continue; }
+                if let Some(old) = &previous[index] {
+                    unsafe { call!(policy.0, 13, [*const u16, i32] [wide(old).as_ptr(), role], i32); }
                 }
-                return Err(result);
             }
+            if let Some((endpoint,original)) = prepared { restore_endpoint_state(endpoint.0,original); }
         }
-        self.default_id(MULTIMEDIA).map(|current| current.is_some_and(|id| id.eq_ignore_ascii_case(target)))
+        selected
     }
     fn device_by_id(&mut self, id: &str) -> Result<Com> {
         let enumerator = self.enumerator()?;
@@ -285,6 +303,15 @@ impl Audio {
         if result.is_err() { self.volume = None; }
         result
     }
+    pub fn volume_at(&mut self, id: &str) -> Result<Volume> {
+        let device = self.device_by_id(id)?;
+        let endpoint = activate_volume(&device)?;
+        Ok(Volume {
+            level: (volume_scalar(endpoint.0)? * 100. + 0.5).clamp(0.,100.) as i32,
+            muted: endpoint_muted(endpoint.0)?,
+        })
+    }
+
     pub fn set_volume(&mut self, level: i32) -> Result<()> {
         let endpoint = self.endpoint_volume()?;
         let scalar = level.clamp(0,100) as f32 / 100.;
@@ -324,6 +351,25 @@ fn volume_scalar(endpoint: Raw) -> Result<f32> {
     Ok(scalar)
 }
 
+fn endpoint_muted(endpoint: Raw) -> Result<bool> {
+    let mut muted = 0i32;
+    checked(unsafe { call!(endpoint, 15, [*mut i32] [&mut muted], i32) })?;
+    Ok(muted != 0)
+}
+
+fn set_endpoint_state(endpoint: Raw, scalar: f32, muted: bool, previous: (f32,bool)) -> Result<()> {
+    if muted && !previous.1 { set_mute(endpoint,true)?; }
+    if scalar != previous.0 { set_scalar(endpoint,scalar)?; }
+    if !muted && previous.1 { set_mute(endpoint,false)?; }
+    Ok(())
+}
+
+fn restore_endpoint_state(endpoint: Raw, previous: (f32,bool)) {
+    if let (Ok(scalar),Ok(muted)) = (volume_scalar(endpoint),endpoint_muted(endpoint)) {
+        let _ = set_endpoint_state(endpoint,previous.0,previous.1,(scalar,muted));
+    }
+}
+
 fn set_scalar(endpoint: Raw, scalar: f32) -> Result<()> {
     checked(unsafe { call!(endpoint, 7, [f32, *const GUID] [scalar, &OWN_VOLUME], i32) })
 }
@@ -350,7 +396,7 @@ fn read_session_identity(control: Com, control2: Com, state: i32, system: bool, 
         if let Some(path) = process_path(pid) {
             let file = path.rsplit('\\').next().unwrap_or(&path);
             let name = custom.unwrap_or_else(|| readable_process_name(file));
-            (path.to_lowercase(), name)
+            (crate::app_picker::path_key(&path), name)
         } else {
             let name = custom.unwrap_or_else(|| format!("{} · {pid}",tr("Приложение")));
             (format!("pid:{pid}"),name)
@@ -385,7 +431,7 @@ fn session_volume(interface: &Com) -> Result<Volume> {
     Ok(Volume { level: (level * 100. + 0.5).clamp(0.,100.) as i32, muted: muted != 0 })
 }
 
-fn readable_process_name(file: &str) -> String {
+pub(crate) fn readable_process_name(file: &str) -> String {
     let name = file.get(..file.len().saturating_sub(4)).filter(|_| {
         file.as_bytes().get(file.len().saturating_sub(4)..).is_some_and(|ext| ext.eq_ignore_ascii_case(b".exe"))
     }).unwrap_or(file);
@@ -398,7 +444,7 @@ fn readable_process_name(file: &str) -> String {
     }
 }
 
-fn process_path(pid: u32) -> Option<String> {
+pub(crate) fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() { return None; }

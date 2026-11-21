@@ -5,12 +5,16 @@
 extern crate alloc;
 
 mod audio;
+mod automation;
+mod app_picker;
 mod gfx;
 mod locale;
 mod motion;
 mod mixer;
 mod palette;
 mod profile_app;
+#[cfg(feature = "profile-audit")]
+mod profile_audit;
 mod profile_ui;
 mod profiles;
 mod runtime;
@@ -73,6 +77,12 @@ pub extern "C" fn main() -> i32 {
         if hr < 0 { return 3; }
         let result = match mode.as_deref() {
             Some("--core-check") => core_check(),
+            #[cfg(feature = "profile-audit")]
+            Some("--profile-audit") => profile_audit::run(),
+            #[cfg(feature = "profile-audit")]
+            Some("--profile-audio-fixture") => profile_audit::fixture(),
+            #[cfg(feature = "profile-audit")]
+            Some("--profile-idle-fixture") => { windows_sys::Win32::System::Threading::Sleep(45000); 0 },
             Some("--render-check") => render_check(),
             Some("--tray-check") => {
                 let host = FindWindowW(wide(CLASS).as_ptr(), wide(HOST_TITLE).as_ptr());
@@ -148,6 +158,7 @@ unsafe fn run_single_instance(demo: bool) -> i32 {
     if !app.update_tray(NIM_ADD, true) { SetTimer(host, TRAY_TIMER, 1000, None); }
     app.set_hotkey(app.settings.shortcut);
     app.sync_profile_hotkeys();
+    app.sync_automation_timer();
     let slot = RefCell::new(app);
     APP = &slot;
     let tray_mouse = tray_mouse::TrayMouse::start(host);
@@ -532,6 +543,12 @@ impl App {
     }
     fn refresh_volume(&mut self) {
         self.volume = self.audio.volume().ok();
+        if let Some(volume) = self.volume {
+            let level = self.limit_profile_volume(volume.level);
+            if level != volume.level && self.audio.set_volume(level).is_ok() {
+                self.volume = self.audio.volume().ok();
+            }
+        }
         let muted = self.volume.is_some_and(|volume| volume.muted);
         if muted != self.tray_muted {
             self.tray_muted = muted;
@@ -602,8 +619,13 @@ impl App {
         if update.is_some() { unsafe { KillTimer(self.host, SLIDER_TIMER); } }
         update
     }
+    fn limit_profile_volume(&mut self, level: i32) -> i32 {
+        let cap = self.profile_cap();
+        if level > cap && self.cap_applies_to_current_output() { cap } else { level }
+    }
     fn set_volume_level(&mut self, level: i32) {
         let Some(volume) = self.volume else { return };
+        let level = self.limit_profile_volume(level);
         if level == volume.level { return; }
         let _ = self.audio.set_volume(level);
         self.refresh_volume();
@@ -615,7 +637,7 @@ impl App {
         self.wheel_remainder %= WHEEL_DELTA as i32;
         if steps == 0 { return; }
         if let Ok(volume) = self.audio.volume() {
-            let level = (volume.level + steps * 2).clamp(0, 100);
+            let level = self.limit_profile_volume((volume.level + steps * 2).clamp(0, 100));
             if level != volume.level { let _ = self.audio.set_volume(level); }
             self.refresh_after_tray_audio();
         }
@@ -780,12 +802,24 @@ impl App {
         let profiles = self.profiles.view(self.profile_height_budget());
         let (hover, focus, mode, kind, form) = (self.hover,self.focus,self.settings.theme,self.kind,self.form.as_ref());
         if kind == WindowKind::Hidden || self.window.hwnd.is_null() { return false; }
-        let painted = self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
-            WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
-            WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
-            WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
-            WindowKind::Menu => ui::menu(g, palette, hover, focus),
-            WindowKind::Hidden => (),
+        let help = if matches!(hover, Some(Action::Help(_))) && self.pressed.is_none() {
+            self.controls().into_iter().find_map(|(action, bounds)| match action {
+                Action::Help(help) if Some(action) == hover => Some((help, bounds)),
+                _ => None,
+            })
+        } else { None };
+        let height = self.height as f32;
+        let painted = self.window.paint(self.position, self.width, self.height, self.scale, |g| {
+            match kind {
+                WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
+                WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
+                WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
+                WindowKind::Menu => ui::menu(g, palette, hover, focus),
+                WindowKind::Hidden => (),
+            }
+            if let Some((help, bounds)) = help {
+                profile_ui::draw_tooltip(g, palette, help, bounds, height);
+            }
         });
         if painted { self.wake_motion(); }
         painted
@@ -861,15 +895,16 @@ impl App {
         let palette = self.palette();
         let position = cursor();
         let width = (text.chars().count() as i32 * 7 + 20).clamp(110, 450);
-        let position = POINT { x: position.x.min(self.area.right - (width as f32*self.scale) as i32).max(self.area.left),
-            y: (position.y + 19).min(self.area.bottom - (30.*self.scale) as i32).max(self.area.top) };
+        let height = 28;
+        let position = POINT { x: position.x.min(self.area.right - ceil_pixels(width as f32*self.scale)).max(self.area.left),
+            y: (position.y + 19).min(self.area.bottom - ceil_pixels(height as f32*self.scale)).max(self.area.top) };
         self.hint.prepare_passive(self.motion_enabled,2);
         if self.hint.ensure(self.instance, true, tr("Устройство вывода"))
-            && self.hint.paint(position, width, 28, self.scale, |g| {
+            && self.hint.paint(position, width, height, self.scale, |g| {
                 g.use_panel_typography();
-                let r = gfx::rect(0.5,0.5,width as f32-1.,27.);
-                g.rounded(r,5.,palette.surface,Some(palette.border));
-                g.text(text,gfx::rect(7.,0.,width as f32-14.,28.),12.,false,0,palette.ink);
+                let r = gfx::rect(0.5,0.5,width as f32-1.,height as f32-1.);
+                g.rounded(r,7.,palette.surface,Some(palette.border));
+                g.text(text,gfx::rect(7.,0.,width as f32-14.,height as f32),12.,false,0,palette.ink);
             }) {
             self.hint.reveal(true);
             self.wake_motion();
@@ -945,7 +980,12 @@ impl App {
             }
             Action::Language(language) => self.change_language(language),
             Action::Save => self.save_form(),
-            Action::Volume | Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_) => (),
+            Action::Help(_) => {
+                self.hover = Some(action);
+                self.draw_window();
+            }
+            Action::Volume | Action::ProfileMaster | Action::ProfileFallbackLevel
+            | Action::ProfilePrimaryCap | Action::ProfileFallbackCap | Action::AppVolume(_) => (),
             action => self.profile_action(action),
         }
     }
@@ -1167,6 +1207,7 @@ impl App {
                     self.wake_motion();
                 }
                 WM_TIMER if wp == HINT_TIMER => self.show_hint(),
+                WM_TIMER if wp == automation::TIMER => self.automation_tick(),
                 WM_TIMER if wp == SLIDER_TIMER => self.flush_slider(),
                 WM_TIMER if wp == MOTION_TIMER => self.motion_tick(),
                 WM_TIMER if wp == EDIT_ANIMATION_TIMER => {
@@ -1205,7 +1246,12 @@ impl App {
                 && self.kind != WindowKind::Settings
                 && !(self.kind == WindowKind::Profiles && matches!(self.profiles.page,
                     profile_ui::Page::Edit | profile_ui::Page::Apps | profile_ui::Page::PickApps
-                    | profile_ui::Page::Output | profile_ui::Page::Fallback)) => self.hide(),
+                    | profile_ui::Page::Output | profile_ui::Page::Fallback | profile_ui::Page::Primary
+                    | profile_ui::Page::Safety | profile_ui::Page::Launch | profile_ui::Page::TriggerPicker)) => self.hide(),
+            WM_ACTIVATE if wp & 0xffff != WA_INACTIVE as usize
+                && self.kind == WindowKind::Profiles && self.profiles.page.is_app_picker() => {
+                self.refresh_running_picker();
+            }
             WM_CLOSE => self.hide(),
             WM_CHAR if self.kind == WindowKind::Profiles && self.profiles.typing => self.profile_char(wp as u16),
             WM_KEYDOWN | WM_SYSKEYDOWN => { if !self.key(wp as u32) { return None; } }
@@ -1301,7 +1347,8 @@ fn cursor() -> POINT {
     point
 }
 fn is_profile_slider(action: Action) -> bool {
-    matches!(action, Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_))
+    matches!(action, Action::ProfileMaster | Action::ProfileFallbackLevel
+        | Action::ProfilePrimaryCap | Action::ProfileFallbackCap | Action::AppVolume(_))
 }
 fn is_slider(action: Action) -> bool { action == Action::Volume || is_profile_slider(action) }
 fn ceil_pixels(value: f32) -> i32 {

@@ -30,6 +30,9 @@ pub enum Action {
     ProfileMuteFallback, ProfileReconnect, ProfileMaster, ProfileMasterMute, ProfileFallbackLevel,
     ProfileApps, ProfileImportApps, ProfileAppPick(usize), ProfileRefreshApps, ProfileShortcut,
     AppVolume(usize), AppMute(usize), AppForget(usize),
+    ProfilePreview, ProfilePrimary, ProfileSafety, ProfileLaunch, ProfileTrigger, ProfileTriggerClear,
+    ProfileAppSource(bool), ProfileBrowseExe, ProfileRequireOutput, ProfileAutoReturn, ProfilePriority(i8), ProfileQuery,
+    ProfileCopyMixer, ProfilePrimaryCap, ProfileFallbackCap, Help(crate::profile_ui::Help),
 }
 
 pub struct Panel<'a> {
@@ -358,8 +361,13 @@ pub struct SettingsView {
     pub language_error: bool,
 }
 pub const MODES: [Mode; 3] = [Mode::Light, Mode::Dark, Mode::System];
-pub fn settings_controls() -> [(Action, RectF);11] {
+pub fn settings_controls() -> [(Action, RectF);15] {
+    use crate::profile_ui::Help;
     [(Action::Back,rect(16.,17.,34.,34.)),
+     (Action::Help(Help::Language),rect(149.,22.,22.,22.)),
+     (Action::Help(Help::GlobalShortcut),rect(287.,67.,22.,22.)),
+     (Action::Help(Help::Theme),rect(287.,140.,22.,22.)),
+     (Action::Help(Help::Startup),rect(287.,217.,22.,22.)),
      (Action::Language(Language::Russian),rect(171.,20.,53.,27.)),
      (Action::Language(Language::English),rect(228.,20.,53.,27.)),
      (Action::Shortcut,rect(16.,89.,WIDTH-32.,32.)),
@@ -387,6 +395,7 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,
         let active = hover == Some(action);
         let focused = focus == Some(action);
         match action {
+            Action::Help(_) => crate::profile_ui::draw_help(g,p,r,active,focused),
             Action::Back => {
                 button(g,p,r,10.,if active {p.hover} else {p.action_fill},focused);
                 let (x,y) = (r.X + r.Width / 2., r.Y + r.Height / 2.);
