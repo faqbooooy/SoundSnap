@@ -1,16 +1,14 @@
 use alloc::{collections::{BTreeMap, BTreeSet}, format, string::String, vec::Vec};
-use crate::{audio::{Device, Session, Volume}, locale::tr, profile_ui::{Page, View},
+use crate::{audio::{Device, Session, Volume}, locale::tr, mixer, profile_ui::{Page, View},
     profiles::{self, AppLevel, Output, Profile}, settings::Shortcut, ui::Action, App, WindowKind};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT};
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-
-pub const TIMER: usize = 6;
 const HOTKEY_BASE: i32 = 1000;
 const HOTKEY_PROBE: i32 = 2000;
 
 pub struct AppChoice {
     pub app: AppLevel,
     pub sessions: usize,
+    pub persistent: bool,
 }
 
 struct Running {
@@ -18,8 +16,9 @@ struct Running {
     output: Option<String>,
     degraded: bool,
     apps_allowed: bool,
-    seen: BTreeSet<String>,
 }
+
+struct Pending { serial: u64, volume: Volume }
 
 pub struct ProfileState {
     list: Vec<Profile>,
@@ -35,10 +34,22 @@ pub struct ProfileState {
     apps: Vec<AppLevel>,
     playing: Vec<bool>,
     choices: Vec<AppChoice>,
-    live_sessions: Vec<Session>,
+    mixer: Option<mixer::Worker>,
+    mixer_rows: Vec<mixer::Row>,
+    mixer_output: Option<Output>,
+    mixer_override: Option<String>,
+    mixer_epoch: u64,
+    mixer_serial: u64,
+    mixer_pending: BTreeMap<String,Pending>,
+    mixer_deferred: Option<mixer::Snapshot>,
+    mixer_numbers: BTreeMap<String,usize>,
+    mixer_next_numbers: BTreeMap<String,usize>,
+    mixer_loading: bool,
+    mixer_unavailable: bool,
+    mixer_incomplete: usize,
+    mixer_write_failed: bool,
     confirm_delete: bool,
     error: &'static str,
-    timer_interval: u32,
     pending_surrogate: Option<u16>,
     registered_hotkeys: Vec<i32>,
 }
@@ -47,7 +58,11 @@ impl ProfileState {
     pub fn new() -> Self {
         Self { list: profiles::load(), draft: None, draft_index: None, running: None,
             page: Page::List, entry: Page::List, typing: false, capturing: false, start: 0, outputs: Vec::new(), apps: Vec::new(),
-            playing: Vec::new(), choices: Vec::new(), live_sessions: Vec::new(), confirm_delete: false, error: "", timer_interval: 0,
+            playing: Vec::new(), choices: Vec::new(), mixer: None, mixer_rows: Vec::new(),
+            mixer_output: None, mixer_override: None, mixer_epoch: 0, mixer_serial: 0,
+            mixer_pending: BTreeMap::new(), mixer_deferred: None, mixer_numbers: BTreeMap::new(),
+            mixer_next_numbers: BTreeMap::new(), mixer_loading: false, mixer_unavailable: false,
+            mixer_incomplete: 0, mixer_write_failed: false, confirm_delete: false, error: "",
             pending_surrogate: None, registered_hotkeys: Vec::new() }
     }
     pub fn name(&self) -> Option<&str> {
@@ -59,6 +74,10 @@ impl ProfileState {
             draft: self.draft.as_ref(), editing_existing: self.draft_index.is_some(), start: self.start,
             outputs: &self.outputs, apps: &self.apps, playing: &self.playing, choices: &self.choices, available_height,
             typing: self.typing, capturing: self.capturing, error: self.error, confirm_delete: self.confirm_delete,
+            mixer_output: self.mixer_output.as_ref().map(|output| output.name.as_str()),
+            mixer_selected: self.mixer_override.as_deref(), mixer_loading: self.mixer_loading,
+            mixer_unavailable: self.mixer_unavailable, mixer_incomplete: self.mixer_incomplete,
+            mixer_write_failed: self.mixer_write_failed,
         }
     }
     pub fn close(&mut self) {
@@ -68,10 +87,7 @@ impl ProfileState {
         self.capturing = false;
         self.pending_surrogate = None;
         self.confirm_delete = false;
-        self.apps.clear();
-        self.playing.clear();
         self.choices.clear();
-        self.live_sessions.clear();
         self.outputs.clear();
     }
 }
@@ -90,8 +106,6 @@ impl App {
         self.profiles.page = self.profiles.entry;
         self.profiles.start = 0;
         self.profiles.error = "";
-        if self.profiles.page == Page::Mixer { self.refresh_mixer(); }
-        self.sync_profile_timer();
     }
 
     fn profile_page(&mut self, page: Page) {
@@ -104,14 +118,13 @@ impl App {
         self.profiles.error = "";
         self.focus = None;
         self.hover = None;
-        if page != Page::Mixer { self.profiles.live_sessions.clear(); }
         match page {
-            Page::Mixer => self.refresh_mixer(),
+            Page::MixerOutputs => self.refresh_profile_outputs(),
             Page::Output | Page::Fallback => self.refresh_profile_outputs(),
             Page::PickApps => self.refresh_app_choices(),
             _ => (),
         }
-        self.sync_profile_timer();
+        self.sync_mixer_watch();
         self.geometry();
         self.begin_page_motion();
         self.draw_window();
@@ -121,6 +134,7 @@ impl App {
         match self.profiles.page {
             Page::List => self.show(WindowKind::Popup,self.anchor),
             Page::Mixer => self.show(WindowKind::Popup,self.anchor),
+            Page::MixerOutputs => self.profile_page(Page::Mixer),
             Page::Edit => {
                 self.profiles.draft = None;
                 self.profiles.draft_index = None;
@@ -144,47 +158,19 @@ impl App {
 
     pub(crate) fn profile_language_changed(&mut self) {
         match self.profiles.page {
-            Page::Mixer if self.pressed.is_none() => self.refresh_mixer(),
+            Page::Mixer if self.pressed.is_none() => {
+                self.apply_mixer_snapshot(mixer::Snapshot {
+                    epoch:self.profiles.mixer_epoch, rows:self.profiles.mixer_rows.clone(),
+                    incomplete:self.profiles.mixer_incomplete, unavailable:self.profiles.mixer_unavailable,
+                });
+            }
             Page::PickApps => self.refresh_app_choices(),
             Page::Output | Page::Fallback => self.refresh_profile_outputs(),
             _ => (),
         }
     }
 
-    fn refresh_mixer(&mut self) {
-        match self.audio.sessions(None) {
-            Ok(mut sessions) => {
-                let mut labels = BTreeMap::new();
-                for session in &sessions { *labels.entry(session.value.name.to_lowercase()).or_insert(0usize) += 1; }
-                sessions.sort_by_cached_key(|session| (session.value.name.to_lowercase(),session.instance.clone()));
-                let mut current = BTreeMap::new();
-                let (apps, playing) = sessions.iter().map(|session| {
-                    let mut value = session.value.clone();
-                    let label = value.name.to_lowercase();
-                    if labels[&label] > 1 {
-                        let index = current.entry(label).or_insert(0);
-                        *index += 1;
-                        value.name = format!("{} · {}",value.name,index);
-                    }
-                    (value,session.active)
-                }).unzip();
-                self.profiles.apps = apps;
-                self.profiles.playing = playing;
-                self.profiles.live_sessions = sessions;
-                self.profiles.error = "";
-                self.clamp_profile_scroll();
-            }
-            Err(_) => {
-                self.profiles.apps.clear();
-                self.profiles.playing.clear();
-                self.profiles.live_sessions.clear();
-                self.profiles.start = 0;
-                self.profiles.error = tr("Не удалось прочитать аудиосессии.");
-            }
-        }
-    }
-
-    fn clamp_profile_scroll(&mut self) {
+    pub(crate) fn clamp_profile_scroll(&mut self) {
         let view = self.profile_model();
         self.profiles.start = self.profiles.start.min(view.count().saturating_sub(view.rows()));
     }
@@ -210,6 +196,17 @@ impl App {
             }
             Action::Profiles => self.profile_page(Page::List),
             Action::Mixer => self.profile_page(Page::Mixer),
+            Action::MixerOutputs => self.profile_page(Page::MixerOutputs),
+            Action::MixerOutputAutomatic => {
+                self.profiles.mixer_override = None;
+                self.profile_page(Page::Mixer);
+            }
+            Action::MixerOutputPick(i) => {
+                if let Some(output) = self.profiles.outputs.get(i) {
+                    self.profiles.mixer_override = Some(output.id.clone());
+                    self.profile_page(Page::Mixer);
+                }
+            }
             Action::ProfileBack => self.profile_back(),
             Action::ProfileCapture => self.capture_profile(),
             Action::ProfileApply(i) => self.activate_profile(i),
@@ -313,15 +310,9 @@ impl App {
                 if let Some(level) = level { app.volume.level = level; }
                 if toggle { app.volume.muted = !app.volume.muted; }
             }
-        } else if let Some(app) = self.profiles.apps.get_mut(index) {
-            let muted = toggle.then_some(!app.volume.muted);
-            if level == Some(app.volume.level) && !toggle { return; }
-            let changed = self.profiles.live_sessions.get(index).is_some_and(|session| session.set(level,muted));
-            if changed {
-                if let Some(level) = level { app.volume.level = level; }
-                if let Some(muted) = muted { app.volume.muted = muted; }
-                self.profiles.error = "";
-            } else { self.profiles.error = tr("Аудиосессия недоступна."); }
+        } else {
+            self.mixer_change(index,level,toggle,true);
+            return;
         }
         self.draw_window();
     }
@@ -379,7 +370,7 @@ impl App {
                 if let Some(choice) = choices.iter_mut().find(|choice| choice.app.key == app.key) {
                     choice.app = app.clone();
                 } else {
-                    choices.push(AppChoice {app: app.clone(), sessions: 0});
+                    choices.push(AppChoice {app: app.clone(), sessions: 0, persistent: true});
                 }
             }
         }
@@ -390,6 +381,7 @@ impl App {
 
     fn toggle_profile_app(&mut self, index: usize) {
         let (Some(choice),Some(profile)) = (self.profiles.choices.get(index), &mut self.profiles.draft) else { return; };
+        if !choice.persistent { return; }
         if let Some(index) = profile.apps.iter().position(|app| app.key == choice.app.key) {
             profile.apps.remove(index);
         } else if profile.apps.len() < profiles::APP_LIMIT {
@@ -572,15 +564,15 @@ impl App {
             if current.is_some() && self.audio.mute_output().is_err() { return false; }
             current
         };
-        self.profiles.running = Some(Running { index, output, degraded, apps_allowed: target.is_some(), seen });
+        self.profiles.running = Some(Running { index, output, degraded, apps_allowed: target.is_some() });
         self.refresh_volume();
-        self.sync_profile_timer();
+        self.sync_mixer_plan(seen);
         true
     }
 
     pub(crate) fn deactivate_profile(&mut self) {
         self.profiles.running = None;
-        self.sync_profile_timer();
+        self.sync_mixer_plan(BTreeSet::new());
     }
 
     pub(crate) fn profile_endpoint_changed(&mut self) {
@@ -605,49 +597,240 @@ impl App {
                 }
             }
         }
-        if self.kind == WindowKind::Profiles && matches!(self.profiles.page, Page::Output | Page::Fallback) {
+        if self.kind == WindowKind::Profiles && matches!(self.profiles.page, Page::Output | Page::Fallback | Page::MixerOutputs) {
             self.refresh_profile_outputs();
             self.geometry();
         }
+        if self.mixer_visible() {
+            self.sync_mixer_watch();
+            if let Some(worker) = &self.profiles.mixer { worker.reconcile(); }
+        }
+    }
+}
+impl App {
+    fn mixer_visible(&self) -> bool {
+        self.kind == WindowKind::Profiles && matches!(self.profiles.page,Page::Mixer | Page::MixerOutputs)
+    }
+
+    fn ensure_mixer_worker(&mut self) -> bool {
+        if self.profiles.mixer.is_none() { self.profiles.mixer = mixer::Worker::start(self.host); }
+        self.profiles.mixer.is_some()
+    }
+
+    pub(crate) fn stop_mixer_worker(&mut self) { self.profiles.mixer = None; }
+
+    pub(crate) fn sync_mixer_watch(&mut self) {
+        if !self.mixer_visible() {
+            // Keep the old output alive until the final value of a just-ended drag is applied.
+            if self.profiles.mixer_pending.is_empty() && self.profiles.mixer_output.is_some() {
+                self.replace_mixer_output(None);
+            }
+            return;
+        }
+        let outputs = match self.audio.devices() {
+            Ok(outputs) => outputs,
+            Err(_) => {
+                self.replace_mixer_output(None);
+                self.profiles.mixer_unavailable = true;
+                return;
+            }
+        };
+        let explicit = self.profiles.mixer_override.as_ref()
+            .and_then(|id| outputs.iter().find(|output| same(id,&output.id)));
+        if explicit.is_none() { self.profiles.mixer_override = None; }
+        let output = explicit.or_else(|| outputs.iter().find(|output| output.selected)).map(output_data);
+        if !same_output(self.profiles.mixer_output.as_ref().map(|o| o.id.as_str()),output.as_ref().map(|o| o.id.as_str())) {
+            self.replace_mixer_output(output);
+        } else {
+            if output.is_none() { self.profiles.mixer_unavailable = false; }
+            self.profiles.mixer_output = output;
+        }
+    }
+
+    fn replace_mixer_output(&mut self, output: Option<Output>) {
+        let p = &mut self.profiles;
+        p.mixer_epoch = p.mixer_epoch.wrapping_add(1);
+        p.mixer_output = output;
+        p.mixer_rows.clear();
+        p.mixer_pending.clear();
+        p.mixer_deferred = None;
+        p.mixer_numbers.clear();
+        p.mixer_next_numbers.clear();
+        p.mixer_loading = p.mixer_output.is_some();
+        p.mixer_unavailable = false;
+        p.mixer_incomplete = 0;
+        p.mixer_write_failed = false;
+        p.apps.clear();
+        p.playing.clear();
+        p.start = 0;
         if self.kind == WindowKind::Profiles && self.profiles.page == Page::Mixer {
-            if self.pressed.is_some() { self.profiles.live_sessions.clear(); }
-            else {
-                self.refresh_mixer();
-                self.geometry();
-            }
-        }
-    }
-
-    pub(crate) fn sync_profile_timer(&mut self) {
-        let interval = if self.kind == WindowKind::Profiles && self.profiles.page == Page::Mixer { 650 }
-            else if self.profiles.running.as_ref().is_some_and(|running| running.apps_allowed
-                && !self.profiles.list[running.index].apps.is_empty()) { 1500 }
-            else { 0 };
-        if self.profiles.timer_interval != interval {
-            unsafe {
-                if interval == 0 { KillTimer(self.host, TIMER); }
-                else { SetTimer(self.host, TIMER, interval, None); }
-            }
-            self.profiles.timer_interval = interval;
-        }
-    }
-
-    pub(crate) fn profile_tick(&mut self) {
-        if self.pressed.is_some() { return; }
-        if let Some(running) = &mut self.profiles.running {
-            let profile = &self.profiles.list[running.index];
-            if let Some(output) = running.output.as_ref() {
-                if running.apps_allowed && !profile.apps.is_empty()
-                    && self.audio.default_id(1).ok().flatten().is_some_and(|id| same(&id,output)) {
-                    restore_apps(&mut self.audio,output,&profile.apps,&mut running.seen);
+            self.focus = None;
+            self.hover = None;
+            if matches!(self.pressed,Some(Action::AppVolume(_) | Action::AppMute(_))) {
+                self.pressed = None;
+                unsafe {
+                    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture,ReleaseCapture};
+                    if GetCapture() == self.window.hwnd { ReleaseCapture(); }
                 }
             }
         }
-        if self.kind == WindowKind::Profiles && self.profiles.page == Page::Mixer {
-            self.refresh_mixer();
+        let watch = self.profiles.mixer_output.as_ref().map(|output| mixer::Watch {
+            epoch:self.profiles.mixer_epoch, output:output.id.clone(),
+        });
+        if watch.is_some() && !self.ensure_mixer_worker() {
+            self.profiles.mixer_loading = false;
+            self.profiles.mixer_unavailable = true;
+        }
+        if let Some(worker) = &self.profiles.mixer { worker.watch(watch); }
+    }
+
+    fn sync_mixer_plan(&mut self, seen: BTreeSet<String>) {
+        let plan = self.profiles.running.as_ref().and_then(|running| {
+            let profile = &self.profiles.list[running.index];
+            if !running.apps_allowed || profile.apps.is_empty() { return None; }
+            Some(mixer::Plan {output:running.output.clone()?,apps:profile.apps.clone(),seen})
+        });
+        if plan.is_some() { self.ensure_mixer_worker(); }
+        if let Some(worker) = &self.profiles.mixer { worker.plan(plan); }
+    }
+
+    pub(crate) fn profile_drag(&mut self, action: Action, level: i32, final_value: bool) {
+        match action {
+            Action::AppVolume(i) if self.profiles.page == Page::Mixer => self.mixer_change(i,Some(level),false,final_value),
+            _ => self.profile_slider(action,level),
+        }
+    }
+
+    fn mixer_change(&mut self, index: usize, level: Option<i32>, toggle: bool, final_value: bool) {
+        let p = &mut self.profiles;
+        let (Some(worker),Some(row),Some(app)) = (p.mixer.as_ref(),p.mixer_rows.get(index),p.apps.get_mut(index)) else { return; };
+        let mute = toggle.then_some(!app.volume.muted);
+        let preview = Volume {level:level.unwrap_or(app.volume.level).clamp(0,100),muted:mute.unwrap_or(app.volume.muted)};
+        let changed = preview != app.volume;
+        if !changed && !(final_value && p.mixer_pending.contains_key(&row.instance)) { return; }
+        p.mixer_serial = p.mixer_serial.wrapping_add(1);
+        let serial = p.mixer_serial;
+        p.mixer_pending.insert(row.instance.clone(),Pending {serial,volume:preview});
+        app.volume = preview;
+        worker.write(mixer::Change {
+            epoch:p.mixer_epoch, instance:row.instance.clone(), serial,
+            level:level.map(|_| preview.level), mute, final_value,
+        });
+        if changed { self.draw_window(); }
+    }
+
+    pub(crate) fn mixer_updates(&mut self) {
+        let Some(worker) = &self.profiles.mixer else { return; };
+        let updates = worker.updates();
+        let mut redraw = false;
+        let mut snapshot_applied = false;
+        if let Some(snapshot) = updates.snapshot.filter(|s| s.epoch == self.profiles.mixer_epoch) {
+            if self.pressed.is_some() && self.kind == WindowKind::Profiles && self.profiles.page == Page::Mixer {
+                self.profiles.mixer_deferred = Some(snapshot);
+            } else {
+                redraw |= self.apply_mixer_snapshot(snapshot);
+                snapshot_applied = true;
+            }
+        }
+        for ack in updates.applied.into_iter().filter(|ack| ack.epoch == self.profiles.mixer_epoch) {
+            if !self.profiles.mixer_pending.get(&ack.instance).is_some_and(|pending| pending.serial <= ack.serial) { continue; }
+            self.profiles.mixer_pending.remove(&ack.instance);
+            let error = ack.volume.is_none();
+            redraw |= error != self.profiles.mixer_write_failed;
+            self.profiles.mixer_write_failed = error;
+            if let Some(index) = self.profiles.mixer_rows.iter().position(|row| row.instance == ack.instance) {
+                let row = &mut self.profiles.mixer_rows[index];
+                if !snapshot_applied {
+                    if let Some(volume) = ack.volume { row.value.volume = volume; }
+                }
+                let preview = &mut self.profiles.apps[index].volume;
+                redraw |= *preview != row.value.volume;
+                *preview = row.value.volume;
+            }
+        }
+        if !self.mixer_visible() { self.sync_mixer_watch(); }
+        if redraw && self.kind == WindowKind::Profiles && self.profiles.page == Page::Mixer {
             if self.height != self.profile_model().height() { self.geometry(); }
             self.draw_window();
         }
+    }
+
+    pub(crate) fn finish_mixer_gesture(&mut self, pressed: Option<Action>) {
+        if self.kind != WindowKind::Profiles || self.profiles.page != Page::Mixer { return; }
+        if let Some(Action::AppVolume(i)) = pressed {
+            if let Some(level) = self.profile_slider_level(Action::AppVolume(i)) {
+                self.mixer_change(i,Some(level),false,true);
+            }
+        }
+        if let Some(snapshot) = self.profiles.mixer_deferred.take() {
+            if self.apply_mixer_snapshot(snapshot) {
+                if self.height != self.profile_model().height() { self.geometry(); }
+                self.draw_window();
+            }
+        }
+    }
+
+    fn apply_mixer_snapshot(&mut self, snapshot: mixer::Snapshot) -> bool {
+        let previous_apps = core::mem::take(&mut self.profiles.apps);
+        let previous_playing = core::mem::take(&mut self.profiles.playing);
+        let status_changed = self.profiles.mixer_loading || self.profiles.mixer_unavailable != snapshot.unavailable
+            || self.profiles.mixer_incomplete != snapshot.incomplete;
+        let previous_focus = self.focus;
+        let previous_start = self.profiles.start;
+        let previous_ids: Vec<_> = self.profiles.mixer_rows.iter().map(|row| row.instance.clone()).collect();
+        let focused = match self.focus {
+            Some(Action::AppVolume(i)) => self.profiles.mixer_rows.get(i).map(|r| (r.instance.clone(),false)),
+            Some(Action::AppMute(i)) => self.profiles.mixer_rows.get(i).map(|r| (r.instance.clone(),true)),
+            _ => None,
+        };
+        if matches!(self.focus,Some(Action::AppVolume(_) | Action::AppMute(_))) { self.focus = None; }
+        self.profiles.mixer_loading = false;
+        self.profiles.mixer_unavailable = snapshot.unavailable;
+        self.profiles.mixer_incomplete = snapshot.incomplete;
+        self.profiles.mixer_rows = snapshot.rows;
+        self.rebuild_mixer_rows();
+        if let Some((instance,mute)) = focused {
+            if let Some(i) = self.profiles.mixer_rows.iter().position(|row| row.instance == instance) {
+                self.focus = Some(if mute {Action::AppMute(i)} else {Action::AppVolume(i)});
+                let rows = self.profile_model().rows();
+                if i < self.profiles.start { self.profiles.start = i; }
+                else if i >= self.profiles.start+rows { self.profiles.start = i+1-rows; }
+                self.clamp_profile_scroll();
+            }
+        }
+        let rows_changed = !previous_ids.iter().map(String::as_str)
+            .eq(self.profiles.mixer_rows.iter().map(|row| row.instance.as_str()));
+        if rows_changed && matches!(self.hover,Some(Action::AppVolume(_) | Action::AppMute(_))) {
+            self.hover = None;
+        }
+        status_changed || rows_changed || previous_apps != self.profiles.apps || previous_playing != self.profiles.playing
+            || previous_focus != self.focus || previous_start != self.profiles.start
+    }
+
+    fn rebuild_mixer_rows(&mut self) {
+        let p = &mut self.profiles;
+        p.mixer_rows.sort_by_cached_key(|row| (row.value.display_name().to_lowercase(),row.instance.clone()));
+        p.mixer_numbers.retain(|instance,_| p.mixer_rows.iter().any(|row| row.instance == *instance));
+        let mut names = BTreeMap::new();
+        for row in &p.mixer_rows { *names.entry(row.value.display_name().to_lowercase()).or_insert(0usize) += 1; }
+        p.mixer_next_numbers.retain(|name,_| names.contains_key(name));
+        let (apps,playing) = p.mixer_rows.iter().map(|row| {
+            let mut app = row.value.clone();
+            if let Some(pending) = p.mixer_pending.get(&row.instance) { app.volume = pending.volume; }
+            let name = app.display_name().to_lowercase();
+            let number = if let Some(number) = p.mixer_numbers.get(&row.instance) { Some(*number) }
+            else if names[&name] > 1 {
+                let next = p.mixer_next_numbers.entry(name).or_insert(0);
+                *next += 1;
+                p.mixer_numbers.insert(row.instance.clone(),*next);
+                Some(*next)
+            } else { None };
+            if let Some(number) = number { app.name = format!("{} · {number}",app.display_name()); }
+            (app,row.active)
+        }).unzip();
+        p.apps = apps;
+        p.playing = playing;
+        self.clamp_profile_scroll();
     }
 }
 
@@ -660,18 +843,19 @@ fn output_data(device: &Device) -> Output { Output { id: device.id.clone(), name
 fn grouped(sessions: &[Session]) -> Vec<AppChoice> {
     let mut values = BTreeMap::new();
     for session in sessions {
-        if session.value.key.starts_with("pid:") { continue; }
         let (status,count) = values.entry(session.value.key.as_str()).or_insert((session,0));
         if session.active && !status.active { *status = session; }
         *count += 1;
     }
     let mut rows: Vec<_> = values.into_values().collect();
     rows.sort_by_cached_key(|(row,_)| row.value.name.to_lowercase());
-    rows.into_iter().map(|(row,sessions)| AppChoice {app: row.value.clone(),sessions}).collect()
+    rows.into_iter().map(|(row,sessions)| AppChoice {
+        app: row.value.clone(),sessions,persistent: !row.value.key.starts_with("pid:"),
+    }).collect()
 }
 
 fn saved_apps(sessions: &[Session]) -> Vec<AppLevel> {
-    grouped(sessions).into_iter().take(profiles::APP_LIMIT).map(|choice| choice.app).collect()
+    grouped(sessions).into_iter().filter(|choice| choice.persistent).take(profiles::APP_LIMIT).map(|choice| choice.app).collect()
 }
 
 fn restore_apps(audio: &mut crate::audio::Audio, output: &str, apps: &[AppLevel], seen: &mut BTreeSet<String>) {

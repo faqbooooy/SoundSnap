@@ -54,6 +54,10 @@ macro_rules! call {
     }};
 }
 
+#[path = "audio_monitor.rs"]
+mod monitor;
+pub use monitor::{SessionMonitor, Signal};
+
 struct Com(Raw);
 impl Com {
     fn create(class: &GUID, iid: &GUID) -> Result<Self> {
@@ -83,9 +87,17 @@ pub struct Session {
     pub value: AppLevel,
     pub instance: String,
     pub active: bool,
+    control: Com,
     interface: Com,
 }
 impl Session {
+    fn sample(&mut self) -> Result<bool> {
+        let state = session_state(&self.control)?;
+        if state == 2 { return Ok(false); }
+        self.active = state == 1;
+        self.value.volume = session_volume(&self.interface)?;
+        Ok(true)
+    }
     pub fn set(&self, level: Option<i32>, muted: Option<bool>) -> bool {
         let interface = self.interface.0;
         let mute = |value| checked(unsafe { call!(interface, 5, [i32, *const GUID] [i32::from(value), &OWN_VOLUME], i32) }).is_ok();
@@ -320,48 +332,89 @@ fn set_mute(endpoint: Raw, muted: bool) -> Result<()> {
 }
 
 fn read_session(control: Com) -> Option<Session> {
-    let mut state = 0i32;
-    checked(unsafe { call!(control.0, 3, [*mut i32] [&mut state], i32) }).ok()?;
+    let state = session_state(&control).ok()?;
     if state == 2 { return None; }
     let control2 = control.query(&SESSION_CONTROL_IID).ok()?;
     let system = unsafe { call!(control2.0, 15, [] [], i32) } == 0;
-    let mut pid = 0u32;
-    checked(unsafe { call!(control2.0, 14, [*mut u32] [&mut pid], i32) }).ok()?;
-    let mut pointer = null_mut();
-    checked(unsafe { call!(control2.0, 13, [*mut *mut u16] [&mut pointer], i32) }).ok()?;
-    let instance = unsafe {
-        let value = decode(pointer);
-        CoTaskMemFree(pointer.cast());
-        value?
-    };
+    let instance = session_text(&control2,13)?;
+    read_session_identity(control,control2,state,system,instance)
+}
+
+fn read_session_identity(control: Com, control2: Com, state: i32, system: bool, instance: String) -> Option<Session> {
     let (key, name) = if system {
         ("system".into(), tr("Системные звуки").into())
-    } else if let Some(path) = process_path(pid) {
-        let file = path.rsplit('\\').next().unwrap_or(&path);
-        let name = file.strip_suffix(".exe").unwrap_or(file).into();
-        (path.to_lowercase(), name)
     } else {
-        // Unknown processes stay usable in the live mixer, but PID identities are not saved.
-        (format!("pid:{pid}"), format!("{} · {pid}",tr("Приложение")))
+        let mut pid = 0u32;
+        unsafe { call!(control2.0,14,[*mut u32] [&mut pid],i32); }
+        let custom = session_text(&control,4).filter(|name| !name.trim().is_empty() && !name.starts_with('@'));
+        if let Some(path) = process_path(pid) {
+            let file = path.rsplit('\\').next().unwrap_or(&path);
+            let name = custom.unwrap_or_else(|| readable_process_name(file));
+            (path.to_lowercase(), name)
+        } else {
+            let name = custom.unwrap_or_else(|| format!("{} · {pid}",tr("Приложение")));
+            (format!("pid:{pid}"),name)
+        }
     };
     let interface = control.query(&SESSION_VOLUME_IID).ok()?;
+    let volume = session_volume(&interface).ok()?;
+    Some(Session { value: AppLevel { key, name, volume }, instance, active: state == 1, control, interface })
+}
+
+fn session_state(control: &Com) -> Result<i32> {
+    let mut state = 0i32;
+    checked(unsafe { call!(control.0,3,[*mut i32] [&mut state],i32) })?;
+    Ok(state)
+}
+
+fn session_text(control: &Com, slot: usize) -> Option<String> {
+    let mut pointer = null_mut();
+    checked(unsafe { call!(control.0,slot,[*mut *mut u16] [&mut pointer],i32) }).ok()?;
+    unsafe {
+        let value = decode(pointer);
+        CoTaskMemFree(pointer.cast());
+        value
+    }
+}
+
+fn session_volume(interface: &Com) -> Result<Volume> {
     let mut level = 0f32;
     let mut muted = 0i32;
-    checked(unsafe { call!(interface.0, 4, [*mut f32] [&mut level], i32) }).ok()?;
-    checked(unsafe { call!(interface.0, 6, [*mut i32] [&mut muted], i32) }).ok()?;
-    let volume = Volume { level: (level * 100. + 0.5).clamp(0.,100.) as i32, muted: muted != 0 };
-    Some(Session { value: AppLevel { key, name, volume }, instance, active: state == 1, interface })
+    checked(unsafe { call!(interface.0, 4, [*mut f32] [&mut level], i32) })?;
+    checked(unsafe { call!(interface.0, 6, [*mut i32] [&mut muted], i32) })?;
+    Ok(Volume { level: (level * 100. + 0.5).clamp(0.,100.) as i32, muted: muted != 0 })
+}
+
+fn readable_process_name(file: &str) -> String {
+    let name = file.get(..file.len().saturating_sub(4)).filter(|_| {
+        file.as_bytes().get(file.len().saturating_sub(4)..).is_some_and(|ext| ext.eq_ignore_ascii_case(b".exe"))
+    }).unwrap_or(file);
+    match name.to_ascii_lowercase().as_str() {
+        "chrome" => "Google Chrome".into(),
+        "msedge" => "Microsoft Edge".into(),
+        "steam" => "Steam".into(),
+        "firefox" => "Firefox".into(),
+        _ => name.into(),
+    }
 }
 
 fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() { return None; }
-        let mut path = vec![0u16; 32768];
+        let mut path = [0u16; 512];
         let mut length = path.len() as u32;
         let result = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length);
+        let value = if result != 0 {
+            Some(String::from_utf16_lossy(&path[..length as usize]))
+        } else if windows_sys::Win32::Foundation::GetLastError() == 122 {
+            let mut long = vec![0u16; 32768];
+            length = long.len() as u32;
+            (QueryFullProcessImageNameW(process,0,long.as_mut_ptr(),&mut length) != 0)
+                .then(|| String::from_utf16_lossy(&long[..length as usize]))
+        } else { None };
         CloseHandle(process);
-        (result != 0).then(|| String::from_utf16_lossy(&path[..length as usize]))
+        value
     }
 }
 

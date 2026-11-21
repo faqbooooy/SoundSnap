@@ -4,7 +4,7 @@ use crate::{audio::Device, gfx::{point, rect, Painter, WHITE}, locale::tr, palet
     profile_app::AppChoice, profiles::{AppLevel, Profile, LIMIT}, ui::{button, close, Action}};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Page { List, Mixer, Edit, Apps, PickApps, Output, Fallback }
+pub enum Page { List, Mixer, MixerOutputs, Edit, Apps, PickApps, Output, Fallback }
 
 pub struct View<'a> {
     pub page: Page,
@@ -22,6 +22,12 @@ pub struct View<'a> {
     pub typing: bool,
     pub capturing: bool,
     pub error: &'a str,
+    pub mixer_output: Option<&'a str>,
+    pub mixer_selected: Option<&'a str>,
+    pub mixer_loading: bool,
+    pub mixer_unavailable: bool,
+    pub mixer_incomplete: usize,
+    pub mixer_write_failed: bool,
 }
 
 const MAX_ROWS: usize = 8;
@@ -39,23 +45,24 @@ impl View<'_> {
             Page::Mixer => self.apps.len(),
             Page::Apps => self.draft.map_or(0, |profile| profile.apps.len()),
             Page::PickApps => self.choices.len(),
-            Page::Output | Page::Fallback => self.outputs.len(),
+            Page::Output | Page::Fallback | Page::MixerOutputs => self.outputs.len(),
             Page::Edit => 0,
         }
     }
     pub fn height(&self) -> i32 {
         match self.page {
             Page::Edit => 405,
-            _ => (144. + self.count().clamp(1,self.rows()) as f32 * self.row_step()) as i32,
+            _ => (144. + self.mixer_extra() + self.count().clamp(1,self.rows()) as f32 * self.row_step()) as i32,
         }
     }
     pub fn rows(&self) -> usize {
-        (((self.available_height - 164.) / self.row_step()) as usize).clamp(1,MAX_ROWS)
+        (((self.available_height - 164. - self.mixer_extra()) / self.row_step()) as usize).clamp(1,MAX_ROWS)
     }
     fn row_step(&self) -> f32 {
         if matches!(self.page, Page::Mixer | Page::Apps) { 48. } else { 39. }
     }
-    fn row_y(&self, row: usize) -> f32 { 87. + row as f32 * self.row_step() }
+    fn mixer_extra(&self) -> f32 { if self.page == Page::Mixer { 28. } else { 0. } }
+    fn row_y(&self, row: usize) -> f32 { 87. + self.mixer_extra() + row as f32 * self.row_step() }
     fn footer(&self) -> f32 { self.height() as f32 - 46. }
 }
 
@@ -79,6 +86,7 @@ pub fn controls(v: &View) -> Vec<(Action, RectF)> {
             if v.page == Page::List && v.selected.is_some() {
                 controls.push((Action::ProfileDeactivate,rect(216.,58.,94.,22.)));
             }
+            if v.page == Page::Mixer { controls.push((Action::MixerOutputs,rect(LEFT,58.,WIDTH,29.))); }
         }
         Page::Edit => {
             controls.extend([
@@ -104,6 +112,7 @@ pub fn controls(v: &View) -> Vec<(Action, RectF)> {
             controls.push((Action::ProfileApps,rect(166.,v.footer(),144.,32.)));
         }
         Page::Fallback => controls.push((Action::ProfileMuteFallback,command(v.footer()))),
+        Page::MixerOutputs => controls.push((Action::MixerOutputAutomatic,command(v.footer()))),
         Page::Output => (),
     }
     for (row, index) in (v.start..(v.start + v.rows()).min(v.count())).enumerate() {
@@ -117,7 +126,9 @@ pub fn controls(v: &View) -> Vec<(Action, RectF)> {
                 if v.page == Page::Apps { controls.push((Action::AppForget(index),rect(293.,y+11.,17.,27.))); }
             }
             Page::Output | Page::Fallback => controls.push((Action::ProfileOutputPick(index),field(y))),
-            Page::PickApps => controls.push((Action::ProfileAppPick(index),rect(LEFT,y,WIDTH,34.))),
+            Page::MixerOutputs => controls.push((Action::MixerOutputPick(index),field(y))),
+            Page::PickApps if v.choices[index].persistent => controls.push((Action::ProfileAppPick(index),rect(LEFT,y,WIDTH,34.))),
+            Page::PickApps => (),
             Page::Edit => (),
         }
     }
@@ -131,6 +142,7 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     g.gradient(rect(0.5,0.5,325.,v.height() as f32-1.),18.,p.glass_start,p.glass_end,p.glass_edge);
     let title = match v.page {
         Page::List => tr("Профили звука"), Page::Mixer => tr("Микшер"),
+        Page::MixerOutputs => tr("Выход микшера"),
         Page::Edit if !v.editing_existing => tr("Новый профиль"),
         Page::Edit => tr("Настройка профиля"), Page::Apps => tr("Громкость приложений"),
         Page::PickApps => tr("Выбор приложений"),
@@ -149,26 +161,39 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     let hint = if !v.error.is_empty() { v.error } else { match v.page {
         Page::List => if v.list.is_empty() { tr("Сохрани настройки для игры, работы или музыки.") }
             else if v.selected.is_some() { tr("Профиль включён") } else { tr("Выбери профиль, чтобы включить его.") },
-        Page::Mixer => tr("Громкость на текущем выходе"),
+        Page::Mixer => "",
+        Page::MixerOutputs => tr("Выбери устройство, сессии которого хочешь видеть."),
         Page::Apps => tr("Уровни применяются при включении профиля."),
         Page::PickApps => tr("Отметь приложения, которыми управляет профиль."),
         Page::Output => tr("Куда выводить звук при включении профиля"),
         Page::Fallback => tr("Куда вывести звук, если основной выход пропадёт"),
         Page::Edit => "",
     }};
-    g.text(hint,rect(LEFT,59.,if v.page == Page::List && v.selected.is_some() {196.} else if v.page == Page::Mixer {235.} else {WIDTH},18.),10.5,false,0,p.secondary_ink);
-    if v.page == Page::Mixer && !v.apps.is_empty() {
-        g.text(&format!("{}",v.apps.len()),rect(260.,59.,50.,18.),10.5,true,2,p.secondary_ink);
+    if v.page == Page::Mixer {
+        let count = format!("{}: {}",tr("Сессий"),v.apps.len());
+        g.text(&count,rect(LEFT,91.,76.,17.),10.5,true,0,p.secondary_ink);
+        let status = if v.mixer_write_failed {
+            tr("Не удалось изменить громкость.").into()
+        } else if v.mixer_incomplete > 0 {
+            format!("{}: {}",tr("Недоступно"),v.mixer_incomplete)
+        } else { "".into() };
+        g.text(&status,rect(100.,91.,210.,17.),10.5,false,2,p.secondary_ink);
+    } else {
+        g.text(hint,rect(LEFT,59.,if v.page == Page::List && v.selected.is_some() {196.} else {WIDTH},18.),
+            10.5,false,0,p.secondary_ink);
     }
     if v.page != Page::Edit && v.count() == 0 {
         let text = match v.page {
+            Page::Mixer if v.mixer_loading => tr("Загружаем сессии…"),
+            Page::Mixer if v.mixer_unavailable => tr("Не удалось прочитать аудиосессии."),
+            Page::Mixer if v.mixer_output.is_none() => tr("Выходные устройства не найдены"),
             Page::Mixer => tr("Запустите звук в нужном приложении."),
             Page::Apps => tr("Выбери приложения кнопкой внизу."),
             Page::PickApps => tr("Запусти звук в приложении и обнови список."),
-            Page::Output | Page::Fallback => tr("Других доступных выходов нет."),
+            Page::Output | Page::Fallback | Page::MixerOutputs => tr("Других доступных выходов нет."),
             _ => "",
         };
-        g.text(text,rect(LEFT,103.,WIDTH,28.),12.,false,1,p.secondary_ink);
+        g.text(text,rect(LEFT,v.row_y(0)+4.,WIDTH,28.),12.,false,1,p.secondary_ink);
     }
     let control = |action: Action, r: RectF, text: &str, primary: bool| {
         let fill = if hover == Some(action) {p.hover} else if primary {p.primary} else {p.elevated};
@@ -180,6 +205,13 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
         match action {
             Action::Profiles => control(action,r,tr("Профили"),false),
             Action::Mixer => control(action,r,tr("Микшер"),false),
+            Action::MixerOutputs => {
+                button(g,p,r,8.,if hover == Some(action) {p.hover} else {p.elevated},focus == Some(action));
+                g.text(tr("Аудиовыход"),rect(r.X+8.,r.Y,70.,r.Height),10.5,false,0,p.secondary_ink);
+                g.text(v.mixer_output.unwrap_or("—"),rect(r.X+81.,r.Y,r.Width-104.,r.Height),11.5,true,0,p.ink);
+                g.text("›",rect(r.X+r.Width-20.,r.Y,15.,r.Height),14.,true,1,p.accent);
+            }
+            Action::MixerOutputAutomatic => control(action,r,tr("Следовать за выходом Windows"),true),
             Action::ProfileCapture => control(action,r,tr("+ Создать профиль"),true),
             Action::ProfileImportApps => control(action,r,tr("Выбрать приложения"),true),
             Action::ProfileRefreshApps => control(action,r,tr("Обновить список"),false),
@@ -197,8 +229,11 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
                 g.text(&profile.name,rect(r.X+8.,r.Y+1.,228.,17.),12.,true,0,p.ink);
                 g.text(&profile.output.name,rect(r.X+8.,r.Y+17.,228.,14.),9.5,false,0,p.secondary_ink);
             }
-            Action::ProfileOutputPick(i) => {
-                button(g,p,r,7.,if hover == Some(action) {p.hover} else {p.card_fill},focus == Some(action));
+            Action::ProfileOutputPick(i) | Action::MixerOutputPick(i) => {
+                let selected = v.page == Page::MixerOutputs && v.mixer_selected
+                    .map_or(v.outputs[i].selected,|id| v.outputs[i].id.eq_ignore_ascii_case(id));
+                let fill = if hover == Some(action) {p.hover} else if selected {p.selected} else {p.card_fill};
+                button(g,p,r,7.,fill,focus == Some(action));
                 g.text(&v.outputs[i].name,rect(r.X+8.,r.Y,r.Width-16.,r.Height),11.5,true,0,p.ink);
             }
             Action::ProfileAppPick(i) => {
@@ -223,8 +258,14 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
             Action::AppVolume(i) => {
                 let app = if v.page == Page::Apps { &v.draft.unwrap().apps[i] } else { &v.apps[i] };
                 let y = r.Y-21.;
-                let ink = if v.page == Page::Mixer && v.playing.get(i) == Some(&true) {p.accent} else {p.ink};
-                g.text(app.display_name(),rect(LEFT,y,252.,19.),11.5,true,0,ink);
+                let status = if app.volume.muted {tr("Без звука")}
+                    else if v.page == Page::Mixer && v.playing.get(i) == Some(&true) {tr("Поток запущен")}
+                    else {""};
+                let title_width = if status.is_empty() {252.} else {186.};
+                g.text(app.display_name(),rect(LEFT,y,title_width,19.),11.5,true,0,p.ink);
+                if !status.is_empty() {
+                    g.text(status,rect(203.,y,107.,19.),9.5,false,2,p.secondary_ink);
+                }
                 slider(g,p,r,app.volume.level,app.volume.muted,focus == Some(action));
             }
             Action::AppMute(i) => {
@@ -233,6 +274,15 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
             }
             Action::AppForget(_) => control(action,r,"×",false),
             _ => (),
+        }
+    }
+    if v.page == Page::PickApps {
+        for (row,choice) in v.choices.iter().skip(v.start).take(v.rows()).enumerate() {
+            if choice.persistent { continue; }
+            let r = rect(LEFT,v.row_y(row),WIDTH,34.);
+            button(g,p,r,7.,p.card_fill,false);
+            g.text(choice.app.display_name(),rect(r.X+9.,r.Y,176.,r.Height),11.5,true,0,p.secondary_ink);
+            g.text(tr("Только в микшере"),rect(r.X+188.,r.Y,96.,r.Height),9.5,false,2,p.secondary_ink);
         }
     }
     if v.page == Page::Edit {

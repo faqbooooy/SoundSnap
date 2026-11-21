@@ -12,7 +12,7 @@ const TRACK_LEFT: f32 = 51.;
 const TRACK_WIDTH: f32 = 164.;
 const CLOSE_X: f32 = WIDTH - 40.;
 const CLOSE_Y: f32 = 17.;
-pub const SETTINGS_HEIGHT: i32 = 366;
+pub const SETTINGS_HEIGHT: i32 = 306;
 pub const TOAST_WIDTH: i32 = 304;
 pub const TOAST_HEIGHT: i32 = 68;
 pub const MENU_WIDTH: i32 = 157;
@@ -25,6 +25,7 @@ pub enum Action {
     Device(usize), QuickDevice(usize), EditDevices, OtherDevices, Volume, Mute, Close, Settings, Back,
     Shortcut, Theme(u8), Language(Language), Startup, Cancel, Save, Open, Exit,
     Profiles, Mixer, ProfileBack, ProfileCapture, ProfileApply(usize), ProfileEdit(usize),
+    MixerOutputs, MixerOutputPick(usize), MixerOutputAutomatic,
     ProfileName, ProfileSave, ProfileDelete, ProfileDeactivate, ProfileOutput, ProfileFallback, ProfileOutputPick(usize),
     ProfileMuteFallback, ProfileReconnect, ProfileMaster, ProfileMasterMute, ProfileFallbackLevel,
     ProfileApps, ProfileImportApps, ProfileAppPick(usize), ProfileRefreshApps, ProfileShortcut,
@@ -357,32 +358,31 @@ pub struct SettingsView {
     pub language_error: bool,
 }
 pub const MODES: [Mode; 3] = [Mode::Light, Mode::Dark, Mode::System];
-pub fn settings_controls() -> [(Action, RectF);12] {
-    [(Action::Back,rect(16.,17.,34.,34.)),(Action::Shortcut,rect(16.,89.,WIDTH-32.,32.)),
+pub fn settings_controls() -> [(Action, RectF);11] {
+    [(Action::Back,rect(16.,17.,34.,34.)),
+     (Action::Language(Language::Russian),rect(171.,20.,53.,27.)),
+     (Action::Language(Language::English),rect(228.,20.,53.,27.)),
+     (Action::Shortcut,rect(16.,89.,WIDTH-32.,32.)),
      (Action::Theme(0),rect(16.,162.,94.,30.)),(Action::Theme(1),rect(116.,162.,94.,30.)),
      (Action::Theme(2),rect(216.,162.,94.,30.)),
-     (Action::Language(Language::System),rect(16.,238.,94.,30.)),
-     (Action::Language(Language::English),rect(116.,238.,94.,30.)),
-     (Action::Language(Language::Russian),rect(216.,238.,94.,30.)),
-     (Action::Startup,rect(17.,290.,WIDTH-34.,24.)),
-     (Action::Cancel,rect(WIDTH-184.,327.,78.,29.)),(Action::Save,rect(WIDTH-98.,327.,82.,29.)),
+     (Action::Startup,rect(17.,215.,WIDTH-34.,24.)),
+     (Action::Cancel,rect(WIDTH-184.,266.,78.,29.)),(Action::Save,rect(WIDTH-98.,266.,82.,29.)),
      (Action::Close,rect(CLOSE_X,CLOSE_Y,26.,26.))]
 }
-pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,language: Language,
+pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,
     hover: Option<Action>,focus: Option<Action>) {
     g.gradient(rect(0.5,0.5,WIDTH-1.,SETTINGS_HEIGHT as f32-1.),23.,p.glass_start,p.glass_end,p.glass_edge);
-    g.text(tr("Настройки"),rect(57.,17.,CLOSE_X-61.,34.),18.,true,0,p.ink);
+    g.text(tr("Настройки"),rect(57.,17.,110.,34.),18.,true,0,p.ink);
     close(g,p,CLOSE_X,CLOSE_Y,hover == Some(Action::Close),focus == Some(Action::Close));
     g.fill(rect(16.,60.,WIDTH-32.,1.),p.line);
     g.text(tr("ГОРЯЧАЯ КЛАВИША"),rect(16.,68.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
     g.text(tr("ОФОРМЛЕНИЕ"),rect(16.,141.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
-    g.text(tr("ЯЗЫК"),rect(16.,215.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
     g.text(tr(form.feedback),rect(16.,122.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
     g.text(tr(form.theme_hint),rect(16.,194.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
     if form.language_error {
-        g.text(tr("Не удалось сохранить язык."),rect(16.,269.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
+        g.text(tr("Не удалось сохранить язык."),rect(16.,240.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
     }
-    g.fill(rect(16.,320.,WIDTH-32.,1.),p.line);
+    g.fill(rect(16.,259.,WIDTH-32.,1.),p.line);
     for (action, r) in settings_controls() {
         let active = hover == Some(action);
         let focused = focus == Some(action);
@@ -407,16 +407,13 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,language:
                 g.text([tr("Светлая"),tr("Тёмная"),tr("Как в Windows")][index],r,11.5,false,1,p.ink);
             }
             Action::Language(choice) => {
-                let checked = language == choice;
+                let checked = crate::locale::current() == choice;
                 let fill = if active {p.hover} else if checked {p.selected} else {p.elevated};
                 let edge = if focused {p.focus} else if checked {p.accent} else {p.border};
                 g.rounded(r,9.,fill,Some(edge));
-                let text = match choice {
-                    Language::System => tr("Как в Windows"),
-                    Language::English => "English",
-                    Language::Russian => "Русский",
-                };
-                g.text(text,r,11.5,checked,1,p.ink);
+                language_flag(g,r.X+5.,r.Y+8.,choice);
+                let text = if choice == Language::Russian { "RUS" } else { "ENG" };
+                g.text(text,rect(r.X+24.,r.Y,r.Width-27.,r.Height),9.5,true,1,p.ink);
             }
             Action::Startup => {
                 let y = r.Y + 6.;
@@ -434,6 +431,26 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,language:
             }
             _ => (),
         }
+    }
+}
+
+fn language_flag(g: &Painter, x: f32, y: f32, language: Language) {
+    const BLUE: Color = 0xFF21468B;
+    const RED: Color = 0xFFE3454F;
+    if language == Language::Russian {
+        g.fill(rect(x,y,16.,3.5),WHITE);
+        g.fill(rect(x,y+3.5,16.,3.5),BLUE);
+        g.fill(rect(x,y+7.,16.,4.),RED);
+    } else {
+        g.fill(rect(x,y,16.,11.),BLUE);
+        for (a,b) in [(y+1.4,y+9.6),(y+9.6,y+1.4)] {
+            g.stroke(&[point(x+1.4,a),point(x+14.6,b)],2.6,WHITE);
+            g.stroke(&[point(x+1.4,a),point(x+14.6,b)],0.8,RED);
+        }
+        g.fill(rect(x,y+3.5,16.,4.),WHITE);
+        g.fill(rect(x+6.,y,4.,11.),WHITE);
+        g.fill(rect(x,y+4.5,16.,2.),RED);
+        g.fill(rect(x+7.,y,2.,11.),RED);
     }
 }
 

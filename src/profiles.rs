@@ -11,7 +11,7 @@ pub struct Output {
     pub name: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppLevel {
     pub key: String,
     pub name: String,

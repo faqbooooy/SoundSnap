@@ -18,8 +18,12 @@ pub fn apply(language: Language) -> bool {
     ENGLISH.swap(english, Relaxed) != english
 }
 
+pub fn current() -> Language {
+    if ENGLISH.load(Relaxed) { Language::English } else { Language::Russian }
+}
+
 pub fn tr(text: &str) -> &str {
-    if !ENGLISH.load(Relaxed) { return text; }
+    if current() == Language::Russian { return text; }
     match text {
         "Устройство вывода" => "Output device",
         "Системные звуки" => "System sounds",
@@ -71,6 +75,15 @@ pub fn tr(text: &str) -> &str {
         "Введите имя. Enter завершает ввод." => "Enter a name, then press Enter.",
         "Нажмите сочетание. Backspace — сбросить." => "Press a shortcut. Backspace to clear.",
         "Аудиосессия недоступна." => "Audio session unavailable.",
+        "Не удалось изменить громкость." => "Couldn't change the volume.",
+        "Выход микшера" => "Mixer output",
+        "Аудиовыход" => "Output",
+        "Выбери устройство, сессии которого хочешь видеть." => "Choose which output to show in the mixer.",
+        "Недоступно" => "Unavailable",
+        "Загружаем сессии…" => "Loading sessions…",
+        "Следовать за выходом Windows" => "Follow the Windows output",
+        "Поток запущен" => "Stream running",
+        "Только в микшере" => "Mixer only",
         "Не удалось получить текущий выход." => "Couldn't read the current output.",
         "Сначала выберите доступное устройство вывода." => "Choose an available output device first.",
         "Профиль" => "Profile",
@@ -145,7 +158,6 @@ pub fn tr(text: &str) -> &str {
         "Настройки" => "Settings",
         "ГОРЯЧАЯ КЛАВИША" => "KEYBOARD SHORTCUT",
         "ОФОРМЛЕНИЕ" => "APPEARANCE",
-        "ЯЗЫК" => "LANGUAGE",
         "Нажмите клавишу или сочетание…" => "Press a key or shortcut…",
         "Светлая" => "Light",
         "Тёмная" => "Dark",

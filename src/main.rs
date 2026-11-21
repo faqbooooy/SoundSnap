@@ -8,12 +8,14 @@ mod audio;
 mod gfx;
 mod locale;
 mod motion;
+mod mixer;
 mod palette;
 mod profile_app;
 mod profile_ui;
 mod profiles;
 mod runtime;
 mod settings;
+mod sync;
 mod tray_mouse;
 mod ui;
 
@@ -107,7 +109,7 @@ fn render_check() -> i32 {
         let Some(mut settings) = Surface::new(ui::PANEL_WIDTH, ui::SETTINGS_HEIGHT) else { return 5 };
         let Some(mut toast) = Surface::new(ui::TOAST_WIDTH,ui::TOAST_HEIGHT) else { return 5 };
         if !panel.draw(1., |g| ui::panel(g, palette, model, None, None))
-            || !settings.draw(1., |g| ui::settings(g, palette, &form, Mode::System, Language::System, None, None))
+            || !settings.draw(1., |g| ui::settings(g, palette, &form, Mode::System, None, None))
             || !toast.draw(1., |g| ui::toast(g, palette, tr("Звук переключён"), tr("Динамики"))) {
             return 5;
         }
@@ -577,7 +579,11 @@ impl App {
         }
     }
     fn queue_slider(&mut self, action: Action, x: f32) {
-        let level = if action == Action::Volume { ui::volume_level(x) } else { profile_ui::level(x) };
+        if action != Action::Volume {
+            self.profile_drag(action,profile_ui::level(x),false);
+            return;
+        }
+        let level = ui::volume_level(x);
         // Mouse moves can arrive much faster than Core Audio and the window can update.
         // Keep only the latest position and leave the scheduled frame in place.
         let first = self.slider_update.replace((action, level)).is_none();
@@ -723,7 +729,7 @@ impl App {
             WindowKind::Menu => (),
             WindowKind::Hidden => return,
         };
-        self.sync_profile_timer();
+        self.sync_mixer_watch();
         if !self.window.ensure(self.instance, false, kind.title()) {
             self.hide();
             return;
@@ -773,11 +779,10 @@ impl App {
             wiggle: EDIT_WIGGLE[self.edit_frame], profile: self.profiles.name() };
         let profiles = self.profiles.view(self.profile_height_budget());
         let (hover, focus, mode, kind, form) = (self.hover,self.focus,self.settings.theme,self.kind,self.form.as_ref());
-        let language = self.settings.language;
         if kind == WindowKind::Hidden || self.window.hwnd.is_null() { return false; }
         let painted = self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
             WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
-            WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, language, hover, focus); } }
+            WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
             WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
             WindowKind::Menu => ui::menu(g, palette, hover, focus),
             WindowKind::Hidden => (),
@@ -787,6 +792,7 @@ impl App {
     }
     fn leave_page(&mut self) {
         self.take_slider();
+        self.finish_mixer_gesture(self.pressed);
         if self.kind == WindowKind::Popup {
             self.stop_device_animation();
             self.devices.clear();
@@ -804,7 +810,7 @@ impl App {
         if self.kind == WindowKind::Hidden { return; }
         self.leave_page();
         self.kind = WindowKind::Hidden;
-        self.sync_profile_timer();
+        self.sync_mixer_watch();
         self.tracking_mouse = false;
         if self.motion_enabled && self.window.shown {
             unsafe { SetWindowLongPtrW(self.window.hwnd,GWL_EXSTYLE,EX_PASSIVE as isize); }
@@ -1130,8 +1136,7 @@ impl App {
                         let mut ignored: MSG = zeroed();
                         while PeekMessageW(&mut ignored,self.host,audio::WM_ENDPOINTS,audio::WM_ENDPOINTS,PM_REMOVE) != 0 {}
                     }
-                    if self.pressed.is_some_and(|action| action == Action::Volume
-                        || (matches!(action,Action::AppVolume(_)) && self.profiles.page == profile_ui::Page::Mixer)) {
+                    if self.pressed == Some(Action::Volume) {
                         self.take_slider();
                         self.pressed = None;
                         unsafe { if GetCapture() == self.window.hwnd { ReleaseCapture(); } }
@@ -1154,6 +1159,7 @@ impl App {
                     }
                     self.refresh_after_tray_audio();
                 }
+                mixer::MESSAGE => self.mixer_updates(),
                 WM_TIMER if wp == TOAST_TIMER => {
                     unsafe { KillTimer(self.host, TOAST_TIMER); }
                     self.notice = None;
@@ -1163,7 +1169,6 @@ impl App {
                 WM_TIMER if wp == HINT_TIMER => self.show_hint(),
                 WM_TIMER if wp == SLIDER_TIMER => self.flush_slider(),
                 WM_TIMER if wp == MOTION_TIMER => self.motion_tick(),
-                WM_TIMER if wp == profile_app::TIMER => self.profile_tick(),
                 WM_TIMER if wp == EDIT_ANIMATION_TIMER => {
                     if self.kind == WindowKind::Popup && self.editing_devices {
                         self.edit_frame += 1;
@@ -1240,22 +1245,27 @@ impl App {
             WM_LBUTTONUP => {
                 let pressed = self.pressed.take();
                 if let Some(action) = pressed.filter(|action| is_slider(*action)) {
-                    self.queue_slider(action,x);
-                    self.flush_slider();
+                    if action == Action::Volume {
+                        self.queue_slider(action,x);
+                        self.flush_slider();
+                    } else { self.profile_drag(action,profile_ui::level(x),true); }
                 }
                 unsafe { if GetCapture() == hwnd { ReleaseCapture(); } }
                 let hit = self.hit(x,y);
                 if let Some(action) = pressed.filter(|item| Some(*item) == hit && !is_slider(*item)) {
                     self.invoke(action);
                 }
+                self.finish_mixer_gesture(None);
             }
             WM_CAPTURECHANGED => {
-                self.pressed = None;
+                let pressed = self.pressed.take();
                 self.flush_slider();
+                self.finish_mixer_gesture(pressed);
             }
             WM_DPICHANGED => {
                 self.scale = ((wp & 0xffff) as f32 / 96.).max(1.);
                 (self.area, _) = screen(self.anchor);
+                if self.kind == WindowKind::Profiles { self.clamp_profile_scroll(); }
                 self.geometry();
                 self.draw_window();
             }
@@ -1267,6 +1277,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.stop_mixer_worker();
         self.audio.stop();
         self.clear_hotkey();
         unsafe {

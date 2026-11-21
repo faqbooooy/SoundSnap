@@ -26,7 +26,7 @@ SoundSnap remembers the volume for each output. When switching through the app, 
 
 ## Mixer and audio profiles
 
-Open **Mixer** from the main panel or the tray menu to adjust or mute individual audio sessions on the current output. Apps such as Discord can have more than one session, so they may have separate sliders.
+Open **Mixer** from the main panel or the tray menu to adjust or mute individual audio sessions. By default it follows the Windows output. Click **Output** in the mixer to view sessions on another connected device. Apps such as Discord can have more than one session, so they may have separate sliders.
 
 Choose **Profiles → Create profile** to start with your current audio settings. Give it a name, choose the apps it should control, and adjust their levels or mute states. Each profile can have a shortcut, a backup output with its own volume, or a mute option when the main output disconnects. You can also choose whether to return to the main output when it reconnects.
 
@@ -34,7 +34,7 @@ Profile rules apply at the app level. If an app has multiple audio sessions, the
 
 ## Settings and updates
 
-SoundSnap follows the Windows display language by default. It uses Russian for Russian Windows and English for other display languages. To override it, choose **English** or **Русский** under **Settings → Language**. Changes apply immediately.
+SoundSnap follows the Windows display language by default. It uses Russian for Russian Windows and English for other display languages. To override it, click **RUS** or **ENG** at the top of **Settings**. Changes apply immediately.
 
 Settings include light, dark, and system themes, a custom keyboard shortcut, and optional startup with Windows. Preferences and profiles are stored in `settings.json` and `profiles.dat` under `%APPDATA%\SoftAudioSwitch`. Device choices and volume levels are stored in the current user's Windows registry. Moving the EXE to another PC does not transfer these settings.
 
