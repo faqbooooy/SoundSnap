@@ -7,6 +7,9 @@ extern crate alloc;
 mod audio;
 mod gfx;
 mod palette;
+mod profile_app;
+mod profile_ui;
+mod profiles;
 mod runtime;
 mod settings;
 mod ui;
@@ -24,6 +27,7 @@ use windows_sys::Win32::{
 use audio::{Audio, Device, Volume};
 use gfx::{contains, GraphicsSession, Surface};
 use palette::{Palette, DARK, LIGHT};
+use profile_app::ProfileState;
 use settings::{Mode, Settings, Shortcut};
 use ui::{Action, Panel, SettingsView};
 
@@ -77,7 +81,7 @@ pub extern "C" fn main() -> i32 {
 fn core_check() -> i32 {
     let mut audio = Audio::default();
     if let Ok(devices) = audio.devices() {
-        if devices.is_empty() || audio.volume().is_ok() { return 0; }
+        if devices.is_empty() || (audio.volume().is_ok() && audio.sessions(None).is_ok()) { return 0; }
     }
     4
 }
@@ -92,7 +96,7 @@ fn render_check() -> i32 {
         let model = Panel {
             devices: &devices, excluded: &[], start: 0, rows: 2, error: false,
             volume: Some(Volume { level: 72, muted: false }),
-            editing: false, expanded: false, wiggle: 0.,
+            editing: false, expanded: false, wiggle: 0., profile: None,
         };
         let Some(mut panel) = Surface::new(ui::PANEL_WIDTH, model.height()) else { return 5 };
         let Some(mut settings) = Surface::new(ui::PANEL_WIDTH, ui::SETTINGS_HEIGHT) else { return 5 };
@@ -136,6 +140,7 @@ unsafe fn run_single_instance(demo: bool) -> i32 {
     app.refresh_volume();
     if !app.update_tray(NIM_ADD, true) { SetTimer(host, TRAY_TIMER, 1000, None); }
     app.set_hotkey(app.settings.shortcut);
+    app.sync_profile_hotkeys();
     let slot = RefCell::new(app);
     APP = &slot;
     MOUSE_HOST = host;
@@ -219,7 +224,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WindowKind { Hidden, Popup, Settings, Menu }
+enum WindowKind { Hidden, Popup, Settings, Profiles, Menu }
 
 struct Layer {
     hwnd: HWND,
@@ -284,6 +289,7 @@ struct App {
     instance: HINSTANCE, host: HWND, taskbar_message: u32,
     icon: HICON, tray_exists: bool, dark: bool, taskbar_dark: bool, tray_muted: bool,
     settings: Settings, hotkey_id: i32, hotkey: Option<Shortcut>,
+    profiles: ProfileState,
     audio: Audio, devices: Vec<Device>, device_error: bool, volume: Option<Volume>,
     demo_devices: Vec<DemoDevice>,
     editing_devices: bool, other_expanded: bool, excluded: Vec<bool>,
@@ -302,7 +308,7 @@ impl App {
             instance, host, taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
             icon: null_mut(), tray_exists: false, dark: settings::dark(settings.theme), taskbar_dark: settings::taskbar_dark(),
             tray_muted: false, volume_popup: Layer::new(), volume_anchor: None,
-            settings, hotkey_id: 0, hotkey: None, audio: Audio::default(), devices: Vec::new(),
+            settings, hotkey_id: 0, hotkey: None, profiles: ProfileState::new(), audio: Audio::default(), devices: Vec::new(),
             demo_devices: Vec::new(),
             editing_devices: false, other_expanded: false, excluded: Vec::new(),
             edit_frame: 0, wheel_remainder: 0,
@@ -373,7 +379,7 @@ impl App {
         Panel { devices: &self.devices, excluded: &self.excluded, start: self.start, rows: self.rows,
             error: self.device_error, volume: self.volume,
             editing: self.editing_devices, expanded: self.other_expanded,
-            wiggle: EDIT_WIGGLE[self.edit_frame] }
+            wiggle: EDIT_WIGGLE[self.edit_frame], profile: self.profiles.name() }
     }
     fn refresh_devices(&mut self) {
         let old_focus = match self.focus { Some(Action::Device(i)) => self.devices.get(i).map(|d| d.id.clone()), _ => None };
@@ -403,7 +409,9 @@ impl App {
         self.draw_volume_popup();
     }
     fn switch_next(&mut self) {
-        if self.kind == WindowKind::Settings { return; }
+        if self.kind == WindowKind::Settings || (self.kind == WindowKind::Profiles && (self.profiles.typing || self.profiles.capturing)) {
+            return;
+        }
         match self.audio.devices() {
             Ok(mut devices) => {
                 devices.retain(|device| !settings::device_hidden(&device.id));
@@ -425,6 +433,7 @@ impl App {
         }
         match self.audio.select(&device.id) {
             Ok(true) => {
+                self.deactivate_profile();
                 self.refresh_volume();
                 self.notify("Звук переключён", &device.name);
                 if self.kind == WindowKind::Popup {
@@ -562,9 +571,14 @@ impl App {
                     capture: false, feedback: SHORTCUT_HINT, theme_hint: THEME_HINT });
                 "Настройки звука"
             }
+            WindowKind::Profiles => {
+                self.reset_profile_view();
+                "SoundSnap — микшер и профили"
+            }
             WindowKind::Menu => "Звук — меню",
             WindowKind::Hidden => return,
         };
+        self.sync_profile_timer();
         if !self.window.ensure(self.instance, false, title) {
             self.hide();
             return;
@@ -583,6 +597,7 @@ impl App {
         (self.width, self.height) = match self.kind {
             WindowKind::Popup => (ui::PANEL_WIDTH, self.window_model().height()),
             WindowKind::Settings => (ui::PANEL_WIDTH, ui::SETTINGS_HEIGHT),
+            WindowKind::Profiles => (ui::PANEL_WIDTH, self.profile_model().height()),
             WindowKind::Menu => (ui::MENU_WIDTH, ui::MENU_HEIGHT),
             WindowKind::Hidden => return,
         };
@@ -602,12 +617,14 @@ impl App {
         let panel = Panel { devices: &self.devices, excluded: &self.excluded, start: self.start, rows: self.rows,
             error: self.device_error, volume: self.volume,
             editing: self.editing_devices, expanded: self.other_expanded,
-            wiggle: EDIT_WIGGLE[self.edit_frame] };
+            wiggle: EDIT_WIGGLE[self.edit_frame], profile: self.profiles.name() };
+        let profiles = self.profiles.view(self.profile_height_budget());
         let (hover, focus, mode, kind, form) = (self.hover,self.focus,self.settings.theme,self.kind,self.form.as_ref());
         if kind == WindowKind::Hidden || self.window.hwnd.is_null() { return false; }
         self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
             WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
             WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
+            WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
             WindowKind::Menu => ui::menu(g, palette, hover, focus),
             WindowKind::Hidden => (),
         })
@@ -618,6 +635,7 @@ impl App {
             self.devices.clear();
             self.excluded.clear();
         }
+        if self.kind == WindowKind::Profiles { self.profiles.close(); }
         self.form = None;
         self.hover = None;
         self.focus = None;
@@ -629,6 +647,7 @@ impl App {
         if self.kind == WindowKind::Hidden { return; }
         self.leave_page();
         self.kind = WindowKind::Hidden;
+        self.sync_profile_timer();
         self.tracking_mouse = false;
         self.window.hide();
     }
@@ -687,6 +706,7 @@ impl App {
         match self.kind {
             WindowKind::Popup => ui::panel_controls(&self.window_model()),
             WindowKind::Settings => ui::settings_controls().into(),
+            WindowKind::Profiles => profile_ui::controls(&self.profile_model()),
             WindowKind::Menu => ui::menu_controls().into(),
             WindowKind::Hidden => Vec::new(),
         }
@@ -748,7 +768,8 @@ impl App {
                 self.draw_window();
             }
             Action::Save => self.save_form(),
-            Action::Volume => (),
+            Action::Volume | Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_) => (),
+            action => self.profile_action(action),
         }
     }
     fn save_form(&mut self) {
@@ -787,6 +808,10 @@ impl App {
     }
 
     fn scroll(&mut self, delta: i32) {
+        if self.kind == WindowKind::Profiles && self.pressed.is_none() {
+            self.profile_scroll(delta);
+            return;
+        }
         if self.kind != WindowKind::Popup || self.pressed.is_some() || !(self.editing_devices || self.other_expanded) {
             return;
         }
@@ -826,6 +851,46 @@ impl App {
     }
 
     fn key(&mut self, vk: u32) -> bool {
+        if self.kind == WindowKind::Profiles {
+            if self.profiles.capturing {
+                match vk as u16 {
+                    VK_ESCAPE => self.stop_shortcut_capture(),
+                    VK_BACK => self.profile_shortcut(None),
+                    VK_SHIFT | VK_CONTROL | VK_MENU | VK_LWIN | VK_RWIN | 0xa0..=0xa5 => (),
+                    key => {
+                        let mods = u32::from(down(VK_MENU)) | (u32::from(down(VK_CONTROL)) << 1)
+                            | (u32::from(down(VK_SHIFT)) << 2);
+                        if key != VK_F12 && (mods != 0 || (0x70..=0x87).contains(&key)) {
+                            self.profile_shortcut(Some(Shortcut { key: vk, mods }));
+                        }
+                    }
+                }
+                return true;
+            }
+            if self.profiles.typing {
+                if vk as u16 == VK_ESCAPE { self.profile_char(13); }
+                return true;
+            }
+            if let Some(action) = self.focus.filter(|action| is_profile_slider(*action)) {
+                if let Some(level) = self.profile_slider_level(action) {
+                    let delta = match vk as u16 {
+                        VK_LEFT | VK_DOWN => -1, VK_RIGHT | VK_UP => 1,
+                        VK_PRIOR => 10, VK_NEXT => -10, VK_HOME => -100, VK_END => 100,
+                        _ => 0,
+                    };
+                    if delta != 0 {
+                        self.profile_slider(action,level+delta);
+                        return true;
+                    }
+                }
+            }
+            if matches!(vk as u16,VK_PRIOR | VK_NEXT) {
+                let delta = if vk as u16 == VK_NEXT { -1 } else { 1 };
+                let rows = self.profile_model().rows();
+                for _ in 0..rows { self.profile_scroll(delta); }
+                return true;
+            }
+        }
         if self.kind == WindowKind::Settings && self.form.as_ref().is_some_and(|form| form.capture) {
             let form = self.form.as_mut().unwrap();
             if vk == u32::from(VK_ESCAPE) {
@@ -846,6 +911,7 @@ impl App {
         }
         match vk as u16 {
             VK_ESCAPE if self.kind == WindowKind::Settings => self.invoke(Action::Back),
+            VK_ESCAPE if self.kind == WindowKind::Profiles => self.profile_back(),
             VK_ESCAPE if self.kind == WindowKind::Popup && self.editing_devices => self.invoke(Action::EditDevices),
             VK_ESCAPE => self.hide(),
             VK_LEFT if self.kind == WindowKind::Settings && down(VK_MENU) => self.invoke(Action::Back),
@@ -881,12 +947,14 @@ impl App {
                 TRAY_WHEEL => self.tray_wheel(wp as isize as i32),
                 TRAY_MUTE => self.tray_mute(),
                 WM_HOTKEY if self.hotkey_id != 0 && wp as i32 == self.hotkey_id => self.switch_next(),
+                WM_HOTKEY => self.profile_hotkey(wp as i32),
                 WM_SETTINGCHANGE | WM_THEMECHANGED => self.sync_theme(),
                 audio::WM_ENDPOINTS => {
                     unsafe {
                         let mut ignored: MSG = zeroed();
                         while PeekMessageW(&mut ignored,self.host,audio::WM_ENDPOINTS,audio::WM_ENDPOINTS,PM_REMOVE) != 0 {}
                     }
+                    self.profile_endpoint_changed();
                     if self.kind == WindowKind::Popup {
                         let old_height = self.height;
                         self.refresh_devices();
@@ -894,6 +962,7 @@ impl App {
                         self.draw_window();
                     } else {
                         self.refresh_volume();
+                        if self.kind == WindowKind::Profiles { self.draw_window(); }
                     }
                 }
                 audio::WM_VOLUME => {
@@ -909,6 +978,7 @@ impl App {
                     self.toast.hide();
                 }
                 WM_TIMER if wp == HINT_TIMER => self.show_hint(),
+                WM_TIMER if wp == profile_app::TIMER => self.profile_tick(),
                 WM_TIMER if wp == EDIT_ANIMATION_TIMER => {
                     if self.kind == WindowKind::Popup && self.editing_devices {
                         self.edit_frame += 1;
@@ -941,12 +1011,21 @@ impl App {
         if hwnd != self.window.hwnd || self.kind == WindowKind::Hidden { return None; }
         let (x,y) = logical_point(lp,self.scale);
         match msg {
-            WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize && self.kind != WindowKind::Settings => self.hide(),
+            WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize
+                && self.kind != WindowKind::Settings
+                && !(self.kind == WindowKind::Profiles && matches!(self.profiles.page,
+                    profile_ui::Page::Edit | profile_ui::Page::Apps | profile_ui::Page::PickApps
+                    | profile_ui::Page::Output | profile_ui::Page::Fallback)) => self.hide(),
             WM_CLOSE => self.hide(),
+            WM_CHAR if self.kind == WindowKind::Profiles && self.profiles.typing => self.profile_char(wp as u16),
             WM_KEYDOWN | WM_SYSKEYDOWN => { if !self.key(wp as u32) { return None; } }
             WM_MOUSEWHEEL => self.scroll((wp >> 16) as i16 as i32),
             WM_MOUSEMOVE => {
                 if self.pressed == Some(Action::Volume) { self.volume_at(x); return Some(0); }
+                if let Some(action) = self.pressed.filter(|action| is_profile_slider(*action)) {
+                    self.profile_slider(action,profile_ui::level(x));
+                    return Some(0);
+                }
                 if !self.tracking_mouse {
                     let mut tracking = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
@@ -970,16 +1049,22 @@ impl App {
             WM_LBUTTONDOWN => {
                 self.hide_hint();
                 self.pressed = self.hit(x,y);
-                self.focus = self.pressed.filter(|action| *action == Action::Volume);
+                self.focus = self.pressed.filter(|action| *action == Action::Volume || is_profile_slider(*action));
                 if self.pressed.is_some() { unsafe { SetCapture(hwnd); } }
                 if self.pressed == Some(Action::Volume) { self.volume_at(x); }
+                if let Some(action) = self.pressed.filter(|action| is_profile_slider(*action)) {
+                    self.profile_slider(action,profile_ui::level(x));
+                }
             }
             WM_LBUTTONUP => {
                 let pressed = self.pressed.take();
                 if pressed == Some(Action::Volume) { self.volume_at(x); }
+                if let Some(action) = pressed.filter(|action| is_profile_slider(*action)) {
+                    self.profile_slider(action,profile_ui::level(x));
+                }
                 unsafe { if GetCapture() == hwnd { ReleaseCapture(); } }
                 let hit = self.hit(x,y);
-                if let Some(action) = pressed.filter(|item| Some(*item) == hit && *item != Action::Volume) {
+                if let Some(action) = pressed.filter(|item| Some(*item) == hit && *item != Action::Volume && !is_profile_slider(*item)) {
                     self.invoke(action);
                 }
             }
@@ -1019,6 +1104,9 @@ fn cursor() -> POINT {
     let mut point = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut point); }
     point
+}
+fn is_profile_slider(action: Action) -> bool {
+    matches!(action, Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_))
 }
 fn ceil_pixels(value: f32) -> i32 {
     let whole = value as i32;

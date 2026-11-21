@@ -78,7 +78,7 @@ pub fn executable_path() -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..size]))
 }
 
-fn settings_path() -> Option<(Vec<u16>, Vec<u16>, Vec<u16>)> {
+fn data_paths(name: &str, temporary: &str) -> Option<(Vec<u16>, Vec<u16>, Vec<u16>)> {
     let variable = crate::wide("APPDATA");
     let length = unsafe { GetEnvironmentVariableW(variable.as_ptr(), null_mut(), 0) } as usize;
     if length == 0 { return None; }
@@ -88,21 +88,25 @@ fn settings_path() -> Option<(Vec<u16>, Vec<u16>, Vec<u16>)> {
     directory.truncate(used);
     directory.extend("\\SoftAudioSwitch".encode_utf16());
     let mut path = directory.clone();
-    path.extend(crate::wide("\\settings.json"));
+    path.extend(crate::wide(name));
     let mut temp = directory.clone();
-    temp.extend(crate::wide("\\settings.tmp"));
+    temp.extend(crate::wide(temporary));
     directory.push(0);
     Some((directory, path, temp))
 }
 
 pub fn read_settings() -> Option<String> {
-    let (_, path, _) = settings_path()?;
+    String::from_utf8(read_data("\\settings.json", 65536)?).ok()
+}
+
+pub fn read_data(name: &str, limit: i64) -> Option<Vec<u8>> {
+    let (_, path, _) = data_paths(name, "")?;
     unsafe {
         let file = CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, null(),
             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null_mut());
         if file == INVALID_HANDLE_VALUE { return None; }
         let mut size = 0i64;
-        if GetFileSizeEx(file,&mut size) == 0 || !(0..=65536).contains(&size) {
+        if GetFileSizeEx(file,&mut size) == 0 || !(0..=limit).contains(&size) {
             CloseHandle(file);
             return None;
         }
@@ -110,14 +114,16 @@ pub fn read_settings() -> Option<String> {
         let mut read = 0;
         let ok = ReadFile(file,text.as_mut_ptr(),size as u32,&mut read,null_mut()) != 0;
         CloseHandle(file);
-        if !ok { return None; }
-        text.truncate(read as usize);
-        String::from_utf8(text).ok()
+        (ok && read as usize == text.len()).then_some(text)
     }
 }
 
 pub fn write_settings(text: &str) -> bool {
-    let Some((directory, path, temp)) = settings_path() else { return false; };
+    write_data("\\settings.json", "\\settings.tmp", text.as_bytes())
+}
+
+pub fn write_data(name: &str, temporary: &str, text: &[u8]) -> bool {
+    let Some((directory, path, temp)) = data_paths(name, temporary) else { return false; };
     unsafe {
         CreateDirectoryW(directory.as_ptr(),null());
         let file = CreateFileW(temp.as_ptr(), GENERIC_WRITE, 0, null(), CREATE_ALWAYS,

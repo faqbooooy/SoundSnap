@@ -16,7 +16,7 @@ pub const SETTINGS_HEIGHT: i32 = 288;
 pub const TOAST_WIDTH: i32 = 304;
 pub const TOAST_HEIGHT: i32 = 68;
 pub const MENU_WIDTH: i32 = 157;
-pub const MENU_HEIGHT: i32 = 92;
+pub const MENU_HEIGHT: i32 = 142;
 pub const TRAY_VOLUME_WIDTH: i32 = 96;
 pub const TRAY_VOLUME_HEIGHT: i32 = 6;
 
@@ -24,6 +24,11 @@ pub const TRAY_VOLUME_HEIGHT: i32 = 6;
 pub enum Action {
     Device(usize), QuickDevice(usize), EditDevices, OtherDevices, Volume, Mute, Close, Settings, Back,
     Shortcut, Theme(u8), Startup, Cancel, Save, Open, Exit,
+    Profiles, Mixer, ProfileBack, ProfileCapture, ProfileApply(usize), ProfileEdit(usize),
+    ProfileName, ProfileSave, ProfileDelete, ProfileDeactivate, ProfileOutput, ProfileFallback, ProfileOutputPick(usize),
+    ProfileMuteFallback, ProfileReconnect, ProfileMaster, ProfileMasterMute, ProfileFallbackLevel,
+    ProfileApps, ProfileImportApps, ProfileAppPick(usize), ProfileRefreshApps, ProfileShortcut,
+    AppVolume(usize), AppMute(usize), AppForget(usize),
 }
 
 pub struct Panel<'a> {
@@ -36,6 +41,7 @@ pub struct Panel<'a> {
     pub editing: bool,
     pub expanded: bool,
     pub wiggle: f32,
+    pub profile: Option<&'a str>,
 }
 
 impl Panel<'_> {
@@ -46,7 +52,7 @@ impl Panel<'_> {
             self.row_top() + self.rows.min(self.devices.len()) as f32 * ROW_SPACING + 12.
         } else { 232. }
     }
-    pub fn height(&self) -> i32 { (self.footer_top() + FOOTER_HEIGHT) as i32 }
+    pub fn height(&self) -> i32 { (self.footer_top() + FOOTER_HEIGHT + if self.editing { 0. } else { 63. }) as i32 }
     fn row_rect(&self, row: usize) -> RectF {
         rect(16., self.row_top() + row as f32 * ROW_SPACING, WIDTH - 32., 35.)
     }
@@ -73,7 +79,7 @@ impl Panel<'_> {
 }
 
 pub fn rows_for_height(height: f32) -> usize {
-    (((height - 245. - FOOTER_HEIGHT) / ROW_SPACING) as usize).clamp(1, 4)
+    (((height - 308. - FOOTER_HEIGHT) / ROW_SPACING) as usize).clamp(1, 4)
 }
 pub fn volume_level(x: f32) -> i32 {
     ((x - TRACK_LEFT) * 100. / TRACK_WIDTH + 0.5).clamp(0., 100.) as i32
@@ -110,6 +116,9 @@ pub fn panel_controls(panel: &Panel) -> Vec<(Action, RectF)> {
     }
     if panel.volume.is_some() {
         controls.extend([(Action::Volume, slider_rect(bottom)), (Action::Mute, mute_rect(bottom))]);
+    }
+    if !panel.editing {
+        controls.extend([(Action::Mixer, audio_tile(bottom,0)), (Action::Profiles, audio_tile(bottom,1))]);
     }
     controls.push((Action::Close, rect(CLOSE_X,CLOSE_Y,26.,26.)));
     controls
@@ -217,8 +226,34 @@ pub fn panel(g: &Painter, p: &Palette, model: Panel, hover: Option<Action>, focu
     }
     if model.shows_rows() { draw_output_rows(g,p,&model,hover,focus); }
     draw_panel_volume(g,p,model.volume,bottom,hover,focus);
+    if !model.editing {
+        for (slot, action, title, subtitle) in [
+            (0,Action::Mixer,"Микшер","Громкость приложений"),
+            (1,Action::Profiles,"Профили",model.profile.unwrap_or("Сценарии звука")),
+        ] {
+            let r = audio_tile(bottom,slot);
+            let edge = if focus == Some(action) || (action == Action::Profiles && model.profile.is_some()) {p.accent} else {p.card_edge};
+            let fill = if hover == Some(action) {p.hover} else {p.card_fill};
+            g.rounded(r,10.,fill,Some(edge));
+            let x = r.X+13.;
+            let y = r.Y+13.;
+            if action == Action::Mixer {
+                for (offset, knob) in [(0.,4.),(5.,10.),(10.,7.)] {
+                    g.stroke(&[point(x+offset,y),point(x+offset,y+17.)],1.35,p.accent);
+                    g.circle(rect(x+offset-1.8,y+knob-1.8,3.6,3.6),p.accent);
+                }
+            } else {
+                for offset in [0.,6.,12.] {
+                    g.stroke(&[point(x,y+offset+2.),point(x+10.,y+offset+2.)],1.5,p.accent);
+                }
+            }
+            g.text(title,rect(r.X+34.,r.Y+5.,r.Width-40.,21.),12.5,true,0,p.ink);
+            g.text(subtitle,rect(r.X+34.,r.Y+24.,r.Width-40.,16.),9.5,false,0,p.secondary_ink);
+        }
+    }
 }
 
+fn audio_tile(bottom: f32, slot: usize) -> RectF { rect(16.+slot as f32*151.,bottom+55.,143.,48.) }
 fn draw_quick_tiles(g: &Painter, p: &Palette, model: &Panel, hover: Option<Action>, focus: Option<Action>) {
     for (slot, index) in model.tile_indices().into_iter().enumerate() {
         let r = tile_rect(slot);
@@ -304,10 +339,10 @@ fn draw_panel_volume(g: &Painter, p: &Palette, volume: Option<Volume>, bottom: f
     g.rounded(mute,8.,fill,Some(if focus == Some(Action::Mute) {p.focus} else {p.card_edge}));
     g.speaker(mute.X+7.,mute.Y+7.,0.82,if muted {p.accent} else {p.ink},!muted,false);
 }
-fn button(g: &Painter, p: &Palette, r: RectF, radius: f32, fill: Color, focus: bool) {
+pub(crate) fn button(g: &Painter, p: &Palette, r: RectF, radius: f32, fill: Color, focus: bool) {
     g.rounded(r,radius,fill,focus.then_some(p.focus));
 }
-fn close(g: &Painter, p: &Palette, x: f32, y: f32, hover: bool, focus: bool) {
+pub(crate) fn close(g: &Painter, p: &Palette, x: f32, y: f32, hover: bool, focus: bool) {
     button(g,p,rect(x,y,26.,26.),7.,if hover { p.hover } else { 0 },focus);
     g.stroke(&[point(x+8.,y+8.),point(x+18.,y+18.)],1.5,p.secondary_ink);
     g.stroke(&[point(x+18.,y+8.),point(x+8.,y+18.)],1.5,p.secondary_ink);
@@ -380,13 +415,15 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode, hover: O
     }
 }
 
-pub fn menu_controls() -> [(Action, RectF);3] {
-    [(Action::Open,rect(4.,4.,149.,25.)),(Action::Settings,rect(4.,29.,149.,25.)),(Action::Exit,rect(4.,63.,149.,25.))]
+pub fn menu_controls() -> [(Action, RectF);5] {
+    [(Action::Open,rect(4.,4.,149.,25.)),(Action::Mixer,rect(4.,29.,149.,25.)),
+        (Action::Profiles,rect(4.,54.,149.,25.)),(Action::Settings,rect(4.,79.,149.,25.)),
+        (Action::Exit,rect(4.,113.,149.,25.))]
 }
 pub fn menu(g: &Painter,p: &Palette,hover: Option<Action>,focus: Option<Action>) {
-    g.rounded(rect(0.5,0.5,156.,91.),5.,p.surface,Some(p.border));
-    g.fill(rect(6.,58.,145.,1.),p.border);
-    for ((action,r), text) in menu_controls().into_iter().zip(["Открыть","Настройки","Выход"]) {
+    g.rounded(rect(0.5,0.5,156.,141.),5.,p.surface,Some(p.border));
+    g.fill(rect(6.,108.,145.,1.),p.border);
+    for ((action,r), text) in menu_controls().into_iter().zip(["Открыть","Микшер","Профили","Настройки","Выход"]) {
         if hover == Some(action) || focus == Some(action) { g.rounded(r,4.,p.hover,None); }
         g.text(text,rect(r.X+9.,r.Y,r.Width-9.,r.Height),12.,false,0,p.ink);
     }

@@ -1,8 +1,9 @@
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::{ffi::c_void, ptr::null_mut, sync::atomic::{AtomicU32, Ordering}};
-use windows_sys::{core::GUID, Win32::{Foundation::HWND, System::Com::{CoCreateInstance, CoTaskMemFree},
+use windows_sys::{core::GUID, Win32::{Foundation::{CloseHandle, HWND}, System::{
+    Com::{CoCreateInstance, CoTaskMemFree}, Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION}},
     UI::WindowsAndMessaging::PostMessageW}};
-use crate::{settings, wide};
+use crate::{profiles::AppLevel, settings, wide};
 
 pub const WM_ENDPOINTS: u32 = 0x8031;
 pub const WM_VOLUME: u32 = 0x8032;
@@ -15,6 +16,9 @@ const ENUMERATOR_IID: GUID = guid(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
 const POLICY_CLASS: GUID = guid(0x870AF99C_171D_4F9E_AF0D_E63DF40C2BC9);
 const POLICY_IID: GUID = guid(0xF8679F50_850A_41CF_9C72_430F290290C8);
 const VOLUME_IID: GUID = guid(0x5CDF2C82_841E_4546_9722_0CF74078229A);
+const SESSION_MANAGER_IID: GUID = guid(0x77AA99A0_1BD6_484F_8BC7_2C654C9A9B6F);
+const SESSION_CONTROL_IID: GUID = guid(0xBFB7FF88_7239_4FC9_8FA2_07C950BE9C6D);
+const SESSION_VOLUME_IID: GUID = guid(0x87CE5498_68D6_44E5_9215_6DA47EF883D8);
 const NOTIFY_IID: GUID = guid(0x7991EEC9_7E89_4D85_8390_6C703CEC60C0);
 const VOLUME_NOTIFY_IID: GUID = guid(0x657804FA_D6AD_4496_8A60_352752AF4F89);
 const IUNKNOWN: GUID = guid(0x00000000_0000_0000_C000_000000000046);
@@ -60,6 +64,11 @@ impl Com {
     fn from_raw(raw: Raw) -> Result<Self> {
         if raw.is_null() { Err(0x80004003_u32 as i32) } else { Ok(Self(raw)) }
     }
+    fn query(&self, iid: &GUID) -> Result<Self> {
+        let mut raw = null_mut();
+        checked(unsafe { call!(self.0, 0, [*const GUID, *mut Raw] [iid, &mut raw], i32) })?;
+        Self::from_raw(raw)
+    }
 }
 impl Drop for Com {
     fn drop(&mut self) { unsafe { call!(self.0, 2, [] [], u32); } }
@@ -67,8 +76,27 @@ impl Drop for Com {
 
 #[derive(Clone, Debug)]
 pub struct Device { pub id: String, pub name: String, pub selected: bool }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Volume { pub level: i32, pub muted: bool }
+
+pub struct Session {
+    pub value: AppLevel,
+    pub instance: String,
+    pub active: bool,
+    interface: Com,
+}
+impl Session {
+    pub fn set(&self, level: Option<i32>, muted: Option<bool>) -> bool {
+        let interface = self.interface.0;
+        let mute = |value| checked(unsafe { call!(interface, 5, [i32, *const GUID] [i32::from(value), &OWN_VOLUME], i32) }).is_ok();
+        if muted == Some(true) && !mute(true) { return false; }
+        if let Some(level) = level {
+            let scalar = level.clamp(0, 100) as f32 / 100.;
+            if unsafe { call!(interface, 3, [f32, *const GUID] [scalar, &OWN_VOLUME], i32) } < 0 { return false; }
+        }
+        muted != Some(false) || mute(false)
+    }
+}
 
 struct EndpointVolume { id: String, interface: Com, notify: Option<*mut Callback> }
 impl Drop for EndpointVolume {
@@ -131,6 +159,9 @@ impl Audio {
         Ok(devices)
     }
     pub fn select(&mut self, target: &str) -> Result<bool> {
+        self.select_with_volume(target, None)
+    }
+    pub fn select_with_volume(&mut self, target: &str, volume: Option<Volume>) -> Result<bool> {
         let roles = [0, 2, 1];
         let previous = [self.default_id(0)?, self.default_id(2)?, self.default_id(1)?];
         let policy = Com::create(&POLICY_CLASS, &POLICY_IID)?;
@@ -140,16 +171,17 @@ impl Audio {
                 if let Ok(scalar) = volume_scalar(endpoint) { settings::remember_volume(current, scalar); }
             }
         }
-        if let Some(saved) = settings::device_volume(target) {
-            let mut raw = null_mut();
-            let enumerator = self.enumerator()?;
-            checked(unsafe { call!(enumerator, 5, [*const u16, *mut Raw] [encoded.as_ptr(), &mut raw], i32) })?;
-            let device = Com::from_raw(raw)?;
+        let saved = volume.map(|volume| volume.level.clamp(0,100) as f32 / 100.)
+            .or_else(|| settings::device_volume(target));
+        if let Some(saved) = saved {
+            let device = self.device_by_id(target)?;
             let endpoint = activate_volume(&device)?;
+            if volume.is_some_and(|volume| volume.muted) { set_mute(endpoint.0, true)?; }
             // Prepare the target before changing any default role.
             if volume_scalar(endpoint.0)? != saved {
                 set_scalar(endpoint.0, saved)?;
             }
+            if volume.is_some_and(|volume| !volume.muted) { set_mute(endpoint.0, false)?; }
         }
         for (index, role) in roles.into_iter().enumerate() {
             if previous[index].as_ref().is_some_and(|old| old.eq_ignore_ascii_case(target)) { continue }
@@ -164,6 +196,34 @@ impl Audio {
             }
         }
         self.default_id(MULTIMEDIA).map(|current| current.is_some_and(|id| id.eq_ignore_ascii_case(target)))
+    }
+    fn device_by_id(&mut self, id: &str) -> Result<Com> {
+        let enumerator = self.enumerator()?;
+        let mut raw = null_mut();
+        checked(unsafe { call!(enumerator, 5, [*const u16, *mut Raw] [wide(id).as_ptr(), &mut raw], i32) })?;
+        Com::from_raw(raw)
+    }
+
+    pub fn sessions(&mut self, output: Option<&str>) -> Result<Vec<Session>> {
+        let device = match output {
+            Some(id) => self.device_by_id(id)?,
+            None => self.default_device(MULTIMEDIA)?,
+        };
+        let manager = activate(&device, &SESSION_MANAGER_IID)?;
+        let mut raw = null_mut();
+        checked(unsafe { call!(manager.0, 5, [*mut Raw] [&mut raw], i32) })?;
+        let sessions = Com::from_raw(raw)?;
+        let mut count = 0i32;
+        checked(unsafe { call!(sessions.0, 3, [*mut i32] [&mut count], i32) })?;
+        let mut result = Vec::new();
+        for index in 0..count {
+            let mut raw = null_mut();
+            if unsafe { call!(sessions.0, 4, [i32, *mut Raw] [index, &mut raw], i32) } < 0 { continue; }
+            if let Ok(control) = Com::from_raw(raw) {
+                if let Some(session) = read_session(control) { result.push(session); }
+            }
+        }
+        Ok(result)
     }
     pub fn watch(&mut self, hwnd: HWND) {
         self.stop();
@@ -228,15 +288,21 @@ impl Audio {
         let endpoint = self.endpoint_volume()?;
         let mut muted = 0;
         checked(unsafe { call!(endpoint, 15, [*mut i32] [&mut muted], i32) })?;
-        checked(unsafe { call!(endpoint, 14, [i32, *const GUID] [i32::from(muted == 0), &OWN_VOLUME], i32) })
+        set_mute(endpoint, muted == 0)
+    }
+    pub fn mute_output(&mut self) -> Result<()> {
+        set_mute(self.endpoint_volume()?, true)
     }
 }
 impl Drop for Audio { fn drop(&mut self) { self.stop(); } }
 
 fn activate_volume(device: &Com) -> Result<Com> {
+    activate(device, &VOLUME_IID)
+}
+fn activate(device: &Com, iid: &GUID) -> Result<Com> {
     let mut raw = null_mut();
     checked(unsafe { call!(device.0, 3, [*const GUID, u32, Raw, *mut Raw]
-        [&VOLUME_IID, CLSCTX_ALL, null_mut(), &mut raw], i32) })?;
+        [iid, CLSCTX_ALL, null_mut(), &mut raw], i32) })?;
     Com::from_raw(raw)
 }
 
@@ -248,6 +314,55 @@ fn volume_scalar(endpoint: Raw) -> Result<f32> {
 
 fn set_scalar(endpoint: Raw, scalar: f32) -> Result<()> {
     checked(unsafe { call!(endpoint, 7, [f32, *const GUID] [scalar, &OWN_VOLUME], i32) })
+}
+fn set_mute(endpoint: Raw, muted: bool) -> Result<()> {
+    checked(unsafe { call!(endpoint, 14, [i32, *const GUID] [i32::from(muted), &OWN_VOLUME], i32) })
+}
+
+fn read_session(control: Com) -> Option<Session> {
+    let mut state = 0i32;
+    checked(unsafe { call!(control.0, 3, [*mut i32] [&mut state], i32) }).ok()?;
+    if state == 2 { return None; }
+    let control2 = control.query(&SESSION_CONTROL_IID).ok()?;
+    let system = unsafe { call!(control2.0, 15, [] [], i32) } == 0;
+    let mut pid = 0u32;
+    checked(unsafe { call!(control2.0, 14, [*mut u32] [&mut pid], i32) }).ok()?;
+    let mut pointer = null_mut();
+    checked(unsafe { call!(control2.0, 13, [*mut *mut u16] [&mut pointer], i32) }).ok()?;
+    let instance = unsafe {
+        let value = decode(pointer);
+        CoTaskMemFree(pointer.cast());
+        value?
+    };
+    let (key, name) = if system {
+        ("system".into(), "Системные звуки".into())
+    } else if let Some(path) = process_path(pid) {
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        let name = file.strip_suffix(".exe").unwrap_or(file).into();
+        (path.to_lowercase(), name)
+    } else {
+        // Unknown processes stay usable in the live mixer, but PID identities are not saved.
+        (format!("pid:{pid}"), format!("Приложение · {pid}"))
+    };
+    let interface = control.query(&SESSION_VOLUME_IID).ok()?;
+    let mut level = 0f32;
+    let mut muted = 0i32;
+    checked(unsafe { call!(interface.0, 4, [*mut f32] [&mut level], i32) }).ok()?;
+    checked(unsafe { call!(interface.0, 6, [*mut i32] [&mut muted], i32) }).ok()?;
+    let volume = Volume { level: (level * 100. + 0.5).clamp(0.,100.) as i32, muted: muted != 0 };
+    Some(Session { value: AppLevel { key, name, volume }, instance, active: state == 1, interface })
+}
+
+fn process_path(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() { return None; }
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        let result = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length);
+        CloseHandle(process);
+        (result != 0).then(|| String::from_utf16_lossy(&path[..length as usize]))
+    }
 }
 
 unsafe fn decode(pointer: *const u16) -> Option<String> {
