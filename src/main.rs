@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod audio;
 mod gfx;
+mod locale;
 mod motion;
 mod palette;
 mod profile_app;
@@ -28,6 +29,7 @@ use windows_sys::Win32::{
 };
 use audio::{Audio, Device, Volume};
 use gfx::{contains, GraphicsSession, Surface};
+use locale::{tr, Language};
 use palette::{Palette, DARK, LIGHT};
 use profile_app::ProfileState;
 use settings::{Mode, Settings, Shortcut};
@@ -92,9 +94,9 @@ fn core_check() -> i32 {
 fn render_check() -> i32 {
     let Some(_session) = GraphicsSession::new() else { return 5 };
     let mut form = SettingsView { shortcut: Shortcut { key: 0x78, mods: 3 }, startup: false,
-        capture: false, feedback: SHORTCUT_HINT, theme_hint: THEME_HINT };
-    let devices = [Device { id: "sample".into(), name: "Динамики (Realtek(R) Audio)".into(), selected: true },
-        Device { id: "sample-2".into(), name: "Динамики (Logitech PRO X Gaming Headset)".into(), selected: false }];
+        capture: false, feedback: SHORTCUT_HINT, theme_hint: THEME_HINT, language_error: false };
+    let devices = [Device { id: "sample".into(), name: tr("Динамики (Realtek(R) Audio)").into(), selected: true },
+        Device { id: "sample-2".into(), name: tr("Динамики (Logitech PRO X Gaming Headset)").into(), selected: false }];
     for palette in [&LIGHT, &DARK] {
         let model = Panel {
             devices: &devices, excluded: &[], start: 0, rows: 2, error: false,
@@ -105,8 +107,8 @@ fn render_check() -> i32 {
         let Some(mut settings) = Surface::new(ui::PANEL_WIDTH, ui::SETTINGS_HEIGHT) else { return 5 };
         let Some(mut toast) = Surface::new(ui::TOAST_WIDTH,ui::TOAST_HEIGHT) else { return 5 };
         if !panel.draw(1., |g| ui::panel(g, palette, model, None, None))
-            || !settings.draw(1., |g| ui::settings(g, palette, &form, Mode::System, None, None))
-            || !toast.draw(1., |g| ui::toast(g, palette, "ЗВУК ПЕРЕКЛЮЧЁН", "Динамики")) {
+            || !settings.draw(1., |g| ui::settings(g, palette, &form, Mode::System, Language::System, None, None))
+            || !toast.draw(1., |g| ui::toast(g, palette, tr("Звук переключён"), tr("Динамики"))) {
             return 5;
         }
         if !panel.rounded_alpha() || !settings.rounded_alpha() || !toast.rounded_alpha() { return 6; }
@@ -201,6 +203,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowKind { Hidden, Popup, Settings, Profiles, Menu }
+impl WindowKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Hidden => "",
+            Self::Popup => tr("Звук — устройства вывода"),
+            Self::Settings => tr("Настройки звука"),
+            Self::Profiles => tr("SoundSnap — микшер и профили"),
+            Self::Menu => tr("Звук — меню"),
+        }
+    }
+}
 
 struct Layer {
     hwnd: HWND,
@@ -308,21 +321,21 @@ struct DemoDevice { device: Device, hidden: bool }
 
 fn demo_devices() -> Vec<DemoDevice> {
     [
-        "Наушники Bluetooth",
-        "Акустика рабочего стола",
-        "Монитор Studio Display (HDMI)",
-        "USB ЦАП — линейный выход",
-        "Наушники для игр",
-        "Домашний кинотеатр (HDMI)",
-        "Портативная колонка",
-        "Динамики ноутбука",
-        "Геймпад — аудиовыход",
-        "Монитор конференц-зала",
-        "Виртуальный выход для записи",
+        tr("Наушники Bluetooth"),
+        tr("Акустика рабочего стола"),
+        tr("Монитор Studio Display (HDMI)"),
+        tr("USB ЦАП — линейный выход"),
+        tr("Наушники для игр"),
+        tr("Домашний кинотеатр (HDMI)"),
+        tr("Портативная колонка"),
+        tr("Динамики ноутбука"),
+        tr("Геймпад — аудиовыход"),
+        tr("Монитор конференц-зала"),
+        tr("Виртуальный выход для записи"),
     ].into_iter().enumerate().map(|(index, name)| DemoDevice {
         device: Device {
             id: alloc::format!("demo:{index}"),
-            name: alloc::format!("[Демо] {name}"),
+            name: alloc::format!("[{}] {name}",tr("Демо")),
             selected: false,
         },
         hidden: index >= 8,
@@ -350,6 +363,7 @@ struct App {
 impl App {
     fn new(instance: HINSTANCE, host: HWND) -> Self {
         let settings = Settings::load();
+        locale::apply(settings.language);
         Self {
             instance, host, taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
             icon: null_mut(), tray_exists: false, dark: settings::dark(settings.theme), taskbar_dark: settings::taskbar_dark(),
@@ -448,6 +462,32 @@ impl App {
             self.window.fade_in(208,0,135);
         }
     }
+    fn sync_language(&mut self) {
+        if !locale::apply(self.settings.language) { return; }
+        match self.kind {
+            WindowKind::Hidden => return,
+            WindowKind::Popup => self.refresh_devices(),
+            WindowKind::Profiles => self.profile_language_changed(),
+            _ => (),
+        }
+        if !self.window.hwnd.is_null() {
+            unsafe { SetWindowTextW(self.window.hwnd,wide(self.kind.title()).as_ptr()); }
+        }
+        self.hide_hint();
+        self.geometry();
+        self.draw_window();
+    }
+    fn change_language(&mut self, language: Language) {
+        let mut next = self.settings;
+        next.language = language;
+        let saved = language == self.settings.language || next.save();
+        if let Some(form) = &mut self.form { form.language_error = !saved; }
+        if saved {
+            self.settings = next;
+            self.sync_language();
+        }
+        self.draw_window();
+    }
     fn sync_theme(&mut self) {
         let tray = settings::taskbar_dark();
         if self.taskbar_dark != tray {
@@ -510,30 +550,30 @@ impl App {
                 if let Some(device) = devices.get(index).or_else(|| devices.first()).filter(|d| !d.selected) {
                     self.select_device(device);
                 } else {
-                    self.notify("Переключение недоступно",
-                        if devices.is_empty() { "Нет основных устройств" } else { "Доступно одно основное устройство" });
+                    self.notify(tr("Переключение недоступно"),
+                        if devices.is_empty() { tr("Нет основных устройств") } else { tr("Доступно одно основное устройство") });
                 }
             }
-            Err(_) => self.notify("Не удалось переключить звук", "Попробуйте выбрать выход вручную"),
+            Err(_) => self.notify(tr("Не удалось переключить звук"), tr("Попробуйте выбрать выход вручную")),
         }
     }
     fn select_device(&mut self, device: &Device) {
         if self.demo_devices.iter().any(|demo| demo.device.id == device.id) {
-            self.notify("Демонстрационное устройство", "Выход звука не изменился");
+            self.notify(tr("Демонстрационное устройство"), tr("Выход звука не изменился"));
             return;
         }
         match self.audio.select(&device.id) {
             Ok(true) => {
                 self.deactivate_profile();
                 self.refresh_volume();
-                self.notify("Звук переключён", &device.name);
+                self.notify(tr("Звук переключён"), &device.name);
                 if self.kind == WindowKind::Popup {
                     for row in &mut self.devices { row.selected = row.id.eq_ignore_ascii_case(&device.id); }
                     self.draw_window();
                 }
             }
-            Ok(false) => self.notify("Смена выхода не подтверждена", "Проверьте активное устройство"),
-            Err(_) => self.notify("Не удалось выбрать устройство", "Проверьте, что оно подключено"),
+            Ok(false) => self.notify(tr("Смена выхода не подтверждена"), tr("Проверьте активное устройство")),
+            Err(_) => self.notify(tr("Не удалось выбрать устройство"), tr("Проверьте, что оно подключено")),
         }
     }
     fn queue_slider(&mut self, action: Action, x: f32) {
@@ -619,7 +659,7 @@ impl App {
         };
         let palette = self.palette();
         self.volume_popup.prepare_passive(self.motion_enabled,1);
-        if self.volume_popup.ensure(self.instance, true, "SoundSnap — громкость")
+        if self.volume_popup.ensure(self.instance, true, tr("SoundSnap — громкость"))
             && self.volume_popup.paint(position, ui::TRAY_VOLUME_WIDTH, ui::TRAY_VOLUME_HEIGHT, scale,
                 |g| ui::tray_volume(g, palette, volume)) {
             self.volume_popup.reveal(true);
@@ -664,7 +704,7 @@ impl App {
         self.area = area;
         self.scale = scale;
         self.kind = kind;
-        let title = match kind {
+        match kind {
             WindowKind::Popup => {
                 self.editing_devices = false;
                 self.other_expanded = false;
@@ -672,22 +712,19 @@ impl App {
                 self.refresh_devices();
                 self.start = self.devices.iter().position(|row| row.selected)
                     .map_or(0, |index| index.saturating_sub(self.rows - 1)).min(self.devices.len().saturating_sub(self.rows));
-                "Звук — устройства вывода"
             }
             WindowKind::Settings => {
                 self.form = Some(SettingsView { shortcut: self.settings.shortcut, startup: settings::launched_on_startup(),
-                    capture: false, feedback: SHORTCUT_HINT, theme_hint: THEME_HINT });
-                "Настройки звука"
+                    capture: false, feedback: SHORTCUT_HINT, theme_hint: THEME_HINT, language_error: false });
             }
             WindowKind::Profiles => {
                 self.reset_profile_view();
-                "SoundSnap — микшер и профили"
             }
-            WindowKind::Menu => "Звук — меню",
+            WindowKind::Menu => (),
             WindowKind::Hidden => return,
         };
         self.sync_profile_timer();
-        if !self.window.ensure(self.instance, false, title) {
+        if !self.window.ensure(self.instance, false, kind.title()) {
             self.hide();
             return;
         }
@@ -736,10 +773,11 @@ impl App {
             wiggle: EDIT_WIGGLE[self.edit_frame], profile: self.profiles.name() };
         let profiles = self.profiles.view(self.profile_height_budget());
         let (hover, focus, mode, kind, form) = (self.hover,self.focus,self.settings.theme,self.kind,self.form.as_ref());
+        let language = self.settings.language;
         if kind == WindowKind::Hidden || self.window.hwnd.is_null() { return false; }
         let painted = self.window.paint(self.position, self.width, self.height, self.scale, |g| match kind {
             WindowKind::Popup => ui::panel(g, palette, panel, hover, focus),
-            WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, hover, focus); } }
+            WindowKind::Settings => { if let Some(form) = form { ui::settings(g, palette, form, mode, language, hover, focus); } }
             WindowKind::Profiles => profile_ui::draw(g,palette,&profiles,hover,focus),
             WindowKind::Menu => ui::menu(g, palette, hover, focus),
             WindowKind::Hidden => (),
@@ -787,7 +825,7 @@ impl App {
         let position = POINT { x: (area.right - ceil_pixels((ui::TOAST_WIDTH + 16) as f32 * scale)).max(area.left),
             y: (area.bottom - ceil_pixels((ui::TOAST_HEIGHT + 16) as f32 * scale)).max(area.top) };
         self.toast.prepare_passive(self.motion_enabled,ceil_pixels(5. * scale));
-        if self.toast.ensure(self.instance, true, "Звук — уведомление")
+        if self.toast.ensure(self.instance, true, tr("Звук — уведомление"))
             && self.toast.paint(position, ui::TOAST_WIDTH, ui::TOAST_HEIGHT, scale, |g| ui::toast(g,palette,&note.title,&note.text)) {
             self.toast.reveal(true);
             self.wake_motion();
@@ -820,7 +858,7 @@ impl App {
         let position = POINT { x: position.x.min(self.area.right - (width as f32*self.scale) as i32).max(self.area.left),
             y: (position.y + 19).min(self.area.bottom - (30.*self.scale) as i32).max(self.area.top) };
         self.hint.prepare_passive(self.motion_enabled,2);
-        if self.hint.ensure(self.instance, true, "Устройство вывода")
+        if self.hint.ensure(self.instance, true, tr("Устройство вывода"))
             && self.hint.paint(position, width, 28, self.scale, |g| {
                 g.use_panel_typography();
                 let r = gfx::rect(0.5,0.5,width as f32-1.,27.);
@@ -861,7 +899,7 @@ impl App {
                         self.excluded[index] = hidden;
                         self.draw_window();
                     } else {
-                        self.notify("Не удалось сохранить список", "Попробуйте ещё раз");
+                        self.notify(tr("Не удалось сохранить список"), tr("Попробуйте ещё раз"));
                     }
                 }
             }
@@ -899,6 +937,7 @@ impl App {
                 if applied { self.settings = next; self.sync_theme(); }
                 self.draw_window();
             }
+            Action::Language(language) => self.change_language(language),
             Action::Save => self.save_form(),
             Action::Volume | Action::ProfileMaster | Action::ProfileFallbackLevel | Action::AppVolume(_) => (),
             action => self.profile_action(action),
@@ -1082,6 +1121,7 @@ impl App {
                 WM_HOTKEY => self.profile_hotkey(wp as i32),
                 WM_SETTINGCHANGE => {
                     self.sync_motion_preference();
+                    self.sync_language();
                     self.sync_theme();
                 }
                 WM_THEMECHANGED => self.sync_theme(),

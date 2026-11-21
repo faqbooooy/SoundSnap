@@ -1,5 +1,5 @@
 use alloc::{string::String, vec::Vec};
-use crate::{audio::Volume, runtime, settings::Shortcut};
+use crate::{audio::Volume, locale::tr, runtime, settings::Shortcut};
 
 pub const LIMIT: usize = 32;
 pub const APP_LIMIT: usize = 128;
@@ -16,6 +16,14 @@ pub struct AppLevel {
     pub key: String,
     pub name: String,
     pub volume: Volume,
+}
+
+impl AppLevel {
+    pub fn display_name(&self) -> &str {
+        if self.key == "system" && matches!(self.name.as_str(),"Системные звуки" | "System sounds") {
+            tr("Системные звуки")
+        } else { &self.name }
+    }
 }
 
 #[derive(Clone)]

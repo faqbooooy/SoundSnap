@@ -1,5 +1,5 @@
 use alloc::{collections::{BTreeMap, BTreeSet}, format, string::String, vec::Vec};
-use crate::{audio::{Device, Session, Volume}, profile_ui::{Page, View},
+use crate::{audio::{Device, Session, Volume}, locale::tr, profile_ui::{Page, View},
     profiles::{self, AppLevel, Output, Profile}, settings::Shortcut, ui::Action, App, WindowKind};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -142,6 +142,15 @@ impl App {
         self.clamp_profile_scroll();
     }
 
+    pub(crate) fn profile_language_changed(&mut self) {
+        match self.profiles.page {
+            Page::Mixer if self.pressed.is_none() => self.refresh_mixer(),
+            Page::PickApps => self.refresh_app_choices(),
+            Page::Output | Page::Fallback => self.refresh_profile_outputs(),
+            _ => (),
+        }
+    }
+
     fn refresh_mixer(&mut self) {
         match self.audio.sessions(None) {
             Ok(mut sessions) => {
@@ -170,7 +179,7 @@ impl App {
                 self.profiles.playing.clear();
                 self.profiles.live_sessions.clear();
                 self.profiles.start = 0;
-                self.profiles.error = "Не удалось прочитать аудиосессии.";
+                self.profiles.error = tr("Не удалось прочитать аудиосессии.");
             }
         }
     }
@@ -218,7 +227,7 @@ impl App {
             Action::ProfileName => {
                 self.profiles.typing = true;
                 self.profiles.capturing = false;
-                self.profiles.error = "Введите имя. Enter завершает ввод.";
+                self.profiles.error = tr("Введите имя. Enter завершает ввод.");
                 self.draw_window();
             }
             Action::ProfileSave => self.save_profile(),
@@ -233,7 +242,7 @@ impl App {
             Action::ProfileShortcut => {
                 self.profiles.typing = false;
                 self.profiles.capturing = true;
-                self.profile_error("Нажмите сочетание. Backspace — сбросить.");
+                self.profile_error(tr("Нажмите сочетание. Backspace — сбросить."));
             }
             Action::ProfileMasterMute => {
                 if let Some(draft) = &mut self.profiles.draft { draft.volume.muted = !draft.volume.muted; }
@@ -312,7 +321,7 @@ impl App {
                 if let Some(level) = level { app.volume.level = level; }
                 if let Some(muted) = muted { app.volume.muted = muted; }
                 self.profiles.error = "";
-            } else { self.profiles.error = "Аудиосессия недоступна."; }
+            } else { self.profiles.error = tr("Аудиосессия недоступна."); }
         }
         self.draw_window();
     }
@@ -320,14 +329,14 @@ impl App {
     fn capture_profile(&mut self) {
         if self.profiles.list.len() >= profiles::LIMIT { return; }
         let Ok(outputs) = self.audio.devices() else {
-            self.profile_error("Не удалось получить текущий выход.");
+            self.profile_error(tr("Не удалось получить текущий выход."));
             return;
         };
         let (Some(output), Ok(volume)) = (outputs.iter().find(|output| output.selected), self.audio.volume()) else {
-            self.profile_error("Сначала выберите доступное устройство вывода.");
+            self.profile_error(tr("Сначала выберите доступное устройство вывода."));
             return;
         };
-        let label = (1..).map(|n| format!("Профиль {n}")).find(|name| {
+        let label = (1..).map(|n| format!("{} {n}",tr("Профиль"))).find(|name| {
             !self.profiles.list.iter().any(|profile| &profile.name == name)
         }).unwrap();
         let apps = self.audio.sessions(None).map(|sessions| saved_apps(&sessions)).unwrap_or_default();
@@ -360,7 +369,7 @@ impl App {
                 sessions
             }
             Err(_) => {
-                self.profiles.error = "Микшер недоступен. Попробуй обновить список.";
+                self.profiles.error = tr("Микшер недоступен. Попробуй обновить список.");
                 Vec::new()
             }
         };
@@ -387,7 +396,7 @@ impl App {
             profile.apps.push(choice.app.clone());
             profile.apps.sort_by_cached_key(|app| app.name.to_lowercase());
         } else {
-            self.profile_error("Достигнут лимит приложений профиля.");
+            self.profile_error(tr("Достигнут лимит приложений профиля."));
             return;
         }
         self.profiles.error = "";
@@ -471,23 +480,23 @@ impl App {
         let Some(mut draft) = self.profiles.draft.clone() else { return; };
         draft.name = draft.name.trim().into();
         if draft.name.is_empty() {
-            self.profile_error("У профиля должно быть имя.");
+            self.profile_error(tr("У профиля должно быть имя."));
             return;
         }
         let index = self.profiles.draft_index;
         let name = draft.name.to_lowercase();
         if self.profiles.list.iter().enumerate().any(|(i,p)| Some(i) != index && p.name.to_lowercase() == name) {
-            self.profile_error("Такое имя уже занято.");
+            self.profile_error(tr("Такое имя уже занято."));
             return;
         }
         if draft.shortcut.is_some_and(|shortcut| !self.shortcut_available(index,shortcut)) {
-            self.profile_error("Горячая клавиша уже занята.");
+            self.profile_error(tr("Горячая клавиша уже занята."));
             return;
         }
         let mut next = self.profiles.list.clone();
         if let Some(i) = index { next[i] = draft; } else { next.push(draft); }
         if !profiles::save(&next) {
-            self.profile_error("Не удалось сохранить профиль.");
+            self.profile_error(tr("Не удалось сохранить профиль."));
             return;
         }
         self.profiles.list = next;
@@ -510,7 +519,7 @@ impl App {
         let mut next = self.profiles.list.clone();
         next.remove(index);
         if !profiles::save(&next) {
-            self.profile_error("Не удалось удалить профиль.");
+            self.profile_error(tr("Не удалось удалить профиль."));
             return;
         }
         self.profiles.list = next;
@@ -531,13 +540,13 @@ impl App {
         let Some(profile) = self.profiles.list.get(index).cloned() else { return; };
         if self.route_profile(index, &profile, true) {
             let status = if self.profiles.running.as_ref().is_some_and(|running| running.degraded) {
-                "Профиль применён с запасным режимом"
-            } else { "Профиль применён" };
+                tr("Профиль применён с запасным режимом")
+            } else { tr("Профиль применён") };
             self.notify(status, &profile.name);
             self.profiles.error = "";
             self.draw_window();
         } else {
-            self.profile_error("Не удалось применить профиль.");
+            self.profile_error(tr("Не удалось применить профиль."));
         }
     }
 
@@ -589,7 +598,7 @@ impl App {
                     if !self.route_profile(index,&profile,!running.degraded || recovered) {
                         let _ = self.audio.mute_output();
                         self.deactivate_profile();
-                        self.notify("Не удалось восстановить выход", &profile.name);
+                        self.notify(tr("Не удалось восстановить выход"), &profile.name);
                     }
                 } else if !unchanged {
                     self.deactivate_profile();

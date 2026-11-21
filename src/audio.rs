@@ -3,7 +3,7 @@ use core::{ffi::c_void, ptr::null_mut, sync::atomic::{AtomicU32, Ordering}};
 use windows_sys::{core::GUID, Win32::{Foundation::{CloseHandle, HWND}, System::{
     Com::{CoCreateInstance, CoTaskMemFree}, Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION}},
     UI::WindowsAndMessaging::PostMessageW}};
-use crate::{profiles::AppLevel, settings, wide};
+use crate::{locale::tr, profiles::AppLevel, settings, wide};
 
 pub const WM_ENDPOINTS: u32 = 0x8031;
 pub const WM_VOLUME: u32 = 0x8032;
@@ -151,7 +151,7 @@ impl Audio {
             if unsafe { call!(collection.0, 4, [u32, *mut Raw] [index, &mut raw], i32) } < 0 { continue }
             let Ok(device) = Com::from_raw(raw) else { continue };
             let Ok(id) = id(&device) else { continue };
-            let name = friendly_name(&device).unwrap_or_else(|| "Устройство вывода".into());
+            let name = friendly_name(&device).unwrap_or_else(|| tr("Устройство вывода").into());
             let active = selected.as_ref().is_some_and(|current| current.eq_ignore_ascii_case(&id));
             devices.push(Device { id, name, selected: active });
         }
@@ -335,14 +335,14 @@ fn read_session(control: Com) -> Option<Session> {
         value?
     };
     let (key, name) = if system {
-        ("system".into(), "Системные звуки".into())
+        ("system".into(), tr("Системные звуки").into())
     } else if let Some(path) = process_path(pid) {
         let file = path.rsplit('\\').next().unwrap_or(&path);
         let name = file.strip_suffix(".exe").unwrap_or(file).into();
         (path.to_lowercase(), name)
     } else {
         // Unknown processes stay usable in the live mixer, but PID identities are not saved.
-        (format!("pid:{pid}"), format!("Приложение · {pid}"))
+        (format!("pid:{pid}"), format!("{} · {pid}",tr("Приложение")))
     };
     let interface = control.query(&SESSION_VOLUME_IID).ok()?;
     let mut level = 0f32;

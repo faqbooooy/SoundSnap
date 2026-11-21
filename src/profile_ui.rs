@@ -1,6 +1,6 @@
 use alloc::{format, vec::Vec};
 use windows_sys::Win32::Graphics::GdiPlus::RectF;
-use crate::{audio::Device, gfx::{point, rect, Painter, WHITE}, palette::Palette,
+use crate::{audio::Device, gfx::{point, rect, Painter, WHITE}, locale::tr, palette::Palette,
     profile_app::AppChoice, profiles::{AppLevel, Profile, LIMIT}, ui::{button, close, Action}};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,11 +130,11 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     g.use_panel_typography();
     g.gradient(rect(0.5,0.5,325.,v.height() as f32-1.),18.,p.glass_start,p.glass_end,p.glass_edge);
     let title = match v.page {
-        Page::List => "Профили звука", Page::Mixer => "Микшер",
-        Page::Edit if !v.editing_existing => "Новый профиль",
-        Page::Edit => "Настройка профиля", Page::Apps => "Громкость приложений",
-        Page::PickApps => "Выбор приложений",
-        Page::Output => "Основной выход", Page::Fallback => "Запасной выход",
+        Page::List => tr("Профили звука"), Page::Mixer => tr("Микшер"),
+        Page::Edit if !v.editing_existing => tr("Новый профиль"),
+        Page::Edit => tr("Настройка профиля"), Page::Apps => tr("Громкость приложений"),
+        Page::PickApps => tr("Выбор приложений"),
+        Page::Output => tr("Основной выход"), Page::Fallback => tr("Запасной выход"),
     };
     g.text(title,rect(52.,HEADER_Y,if matches!(v.page,Page::List | Page::Mixer) {152.} else {224.},26.),16.,true,0,p.ink);
     let icon_x = 29.;
@@ -147,13 +147,13 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     g.fill(rect(LEFT,54.,WIDTH,1.),p.line);
 
     let hint = if !v.error.is_empty() { v.error } else { match v.page {
-        Page::List => if v.list.is_empty() { "Сохрани настройки для игры, работы или музыки." }
-            else if v.selected.is_some() { "Профиль включён" } else { "Выбери профиль, чтобы включить его." },
-        Page::Mixer => "Громкость на текущем выходе",
-        Page::Apps => "Уровни применяются при включении профиля.",
-        Page::PickApps => "Отметь приложения, которыми управляет профиль.",
-        Page::Output => "Куда выводить звук при включении профиля",
-        Page::Fallback => "Куда вывести звук, если основной выход пропадёт",
+        Page::List => if v.list.is_empty() { tr("Сохрани настройки для игры, работы или музыки.") }
+            else if v.selected.is_some() { tr("Профиль включён") } else { tr("Выбери профиль, чтобы включить его.") },
+        Page::Mixer => tr("Громкость на текущем выходе"),
+        Page::Apps => tr("Уровни применяются при включении профиля."),
+        Page::PickApps => tr("Отметь приложения, которыми управляет профиль."),
+        Page::Output => tr("Куда выводить звук при включении профиля"),
+        Page::Fallback => tr("Куда вывести звук, если основной выход пропадёт"),
         Page::Edit => "",
     }};
     g.text(hint,rect(LEFT,59.,if v.page == Page::List && v.selected.is_some() {196.} else if v.page == Page::Mixer {235.} else {WIDTH},18.),10.5,false,0,p.secondary_ink);
@@ -162,10 +162,10 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     }
     if v.page != Page::Edit && v.count() == 0 {
         let text = match v.page {
-            Page::Mixer => "Запустите звук в нужном приложении.",
-            Page::Apps => "Выбери приложения кнопкой внизу.",
-            Page::PickApps => "Запусти звук в приложении и обнови список.",
-            Page::Output | Page::Fallback => "Других доступных выходов нет.",
+            Page::Mixer => tr("Запустите звук в нужном приложении."),
+            Page::Apps => tr("Выбери приложения кнопкой внизу."),
+            Page::PickApps => tr("Запусти звук в приложении и обнови список."),
+            Page::Output | Page::Fallback => tr("Других доступных выходов нет."),
             _ => "",
         };
         g.text(text,rect(LEFT,103.,WIDTH,28.),12.,false,1,p.secondary_ink);
@@ -178,16 +178,16 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     };
     for (action, r) in controls(v) {
         match action {
-            Action::Profiles => control(action,r,"Профили",false),
-            Action::Mixer => control(action,r,"Микшер",false),
-            Action::ProfileCapture => control(action,r,"+ Создать профиль",true),
-            Action::ProfileImportApps => control(action,r,"Выбрать приложения",true),
-            Action::ProfileRefreshApps => control(action,r,"Обновить список",false),
-            Action::ProfileApps if v.page == Page::PickApps => control(action,r,"Готово",true),
-            Action::ProfileMuteFallback => control(action,r,"Оставить без звука",true),
-            Action::ProfileSave => control(action,r,if v.editing_existing {"Сохранить"} else {"Создать профиль"},true),
-            Action::ProfileDeactivate => control(action,r,"Выключить",false),
-            Action::ProfileDelete => control(action,r,if v.confirm_delete {"Подтвердить"} else {"Удалить"},false),
+            Action::Profiles => control(action,r,tr("Профили"),false),
+            Action::Mixer => control(action,r,tr("Микшер"),false),
+            Action::ProfileCapture => control(action,r,tr("+ Создать профиль"),true),
+            Action::ProfileImportApps => control(action,r,tr("Выбрать приложения"),true),
+            Action::ProfileRefreshApps => control(action,r,tr("Обновить список"),false),
+            Action::ProfileApps if v.page == Page::PickApps => control(action,r,tr("Готово"),true),
+            Action::ProfileMuteFallback => control(action,r,tr("Оставить без звука"),true),
+            Action::ProfileSave => control(action,r,if v.editing_existing {tr("Сохранить")} else {tr("Создать профиль")},true),
+            Action::ProfileDeactivate => control(action,r,tr("Выключить"),false),
+            Action::ProfileDelete => control(action,r,if v.confirm_delete {tr("Подтвердить")} else {tr("Удалить")},false),
             Action::ProfileEdit(_) => control(action,r,"✎",false),
             Action::ProfileApply(i) => {
                 let profile = &v.list[i];
@@ -213,18 +213,18 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
                         point(box_rect.X+12.,box_rect.Y+5.)],1.4,WHITE);
                 }
                 let detail = match choice.sessions {
-                    0 => "Закрыто".into(),
+                    0 => tr("Закрыто").into(),
                     1 => "".into(),
-                    count => format!("Сессий: {count}"),
+                    count => format!("{}: {count}",tr("Сессий")),
                 };
-                g.text(&choice.app.name,rect(r.X+34.,r.Y,174.,r.Height),11.5,true,0,p.ink);
+                g.text(choice.app.display_name(),rect(r.X+34.,r.Y,174.,r.Height),11.5,true,0,p.ink);
                 g.text(&detail,rect(r.X+211.,r.Y,74.,r.Height),10.,false,2,p.secondary_ink);
             }
             Action::AppVolume(i) => {
                 let app = if v.page == Page::Apps { &v.draft.unwrap().apps[i] } else { &v.apps[i] };
                 let y = r.Y-21.;
                 let ink = if v.page == Page::Mixer && v.playing.get(i) == Some(&true) {p.accent} else {p.ink};
-                g.text(&app.name,rect(LEFT,y,252.,19.),11.5,true,0,ink);
+                g.text(app.display_name(),rect(LEFT,y,252.,19.),11.5,true,0,ink);
                 slider(g,p,r,app.volume.level,app.volume.muted,focus == Some(action));
             }
             Action::AppMute(i) => {
@@ -238,24 +238,24 @@ pub fn draw(g: &Painter, p: &Palette, v: &View, hover: Option<Action>, focus: Op
     if v.page == Page::Edit {
         if let Some(profile) = v.draft {
             let name = if v.typing { format!("{}│",profile.name) } else { profile.name.clone() };
-            pair(g,p,rect(LEFT,78.,WIDTH,25.),"Название",&name,focus == Some(Action::ProfileName) || v.typing);
-            pair(g,p,rect(LEFT,106.,WIDTH,29.),"Устройство вывода",&profile.output.name,focus == Some(Action::ProfileOutput));
-            g.text("Общая громкость",rect(LEFT,137.,188.,14.),9.5,false,0,p.secondary_ink);
+            pair(g,p,rect(LEFT,78.,WIDTH,25.),tr("Название"),&name,focus == Some(Action::ProfileName) || v.typing);
+            pair(g,p,rect(LEFT,106.,WIDTH,29.),tr("Устройство вывода"),&profile.output.name,focus == Some(Action::ProfileOutput));
+            g.text(tr("Общая громкость"),rect(LEFT,137.,188.,14.),9.5,false,0,p.secondary_ink);
             slider(g,p,bar(158.),profile.volume.level,profile.volume.muted,focus == Some(Action::ProfileMaster));
             mute(g,p,rect(276.,145.,34.,26.),profile.volume.muted,hover == Some(Action::ProfileMasterMute),
                 focus == Some(Action::ProfileMasterMute));
-            pair(g,p,field(177.),"Громкость приложений",&format!("Выбрано: {} ›",profile.apps.len()),focus == Some(Action::ProfileApps));
-            pair(g,p,field(215.),"Если выход отключится",profile.fallback.as_ref().map_or("Без звука",|output| &output.name),
+            pair(g,p,field(177.),tr("Громкость приложений"),&format!("{}: {} ›",tr("Выбрано"),profile.apps.len()),focus == Some(Action::ProfileApps));
+            pair(g,p,field(215.),tr("Если выход отключится"),profile.fallback.as_ref().map_or(tr("Без звука"),|output| &output.name),
                 focus == Some(Action::ProfileFallback));
             if profile.fallback.is_some() {
-                g.text("Громкость запасного выхода",rect(LEFT,245.,250.,14.),9.5,false,0,p.secondary_ink);
+                g.text(tr("Громкость запасного выхода"),rect(LEFT,245.,250.,14.),9.5,false,0,p.secondary_ink);
                 slider(g,p,bar(263.),profile.fallback_level.into(),false,focus == Some(Action::ProfileFallbackLevel));
             }
-            pair(g,p,field(282.),"Вернуть звук на основной",if profile.reconnect {"Да"} else {"Нет"},
+            pair(g,p,field(282.),tr("Вернуть звук на основной"),if profile.reconnect {tr("Да")} else {tr("Нет")},
                 focus == Some(Action::ProfileReconnect));
-            let shortcut = if v.capturing { "Нажмите клавиши…".into() }
-                else {profile.shortcut.map_or_else(|| "Не задана".into(),|shortcut| shortcut.labels().join(" + ")) };
-            pair(g,p,field(318.),"Горячая клавиша",&shortcut,focus == Some(Action::ProfileShortcut) || v.capturing);
+            let shortcut = if v.capturing { tr("Нажмите клавиши…").into() }
+                else {profile.shortcut.map_or_else(|| tr("Не задана").into(),|shortcut| shortcut.labels().join(" + ")) };
+            pair(g,p,field(318.),tr("Горячая клавиша"),&shortcut,focus == Some(Action::ProfileShortcut) || v.capturing);
         }
     }
     if v.count() > v.rows() {

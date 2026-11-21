@@ -1,7 +1,7 @@
 use alloc::{format, string::{String, ToString}, vec::Vec};
 use core::ptr::null_mut;
 use windows_sys::Win32::System::Registry::*;
-use crate::{runtime, wide};
+use crate::{locale::Language, runtime, wide};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode { System, Light, Dark }
@@ -10,7 +10,7 @@ pub enum Mode { System, Light, Dark }
 pub struct Shortcut { pub key: u32, pub mods: u32 }
 
 #[derive(Clone, Copy)]
-pub struct Settings { pub shortcut: Shortcut, pub theme: Mode }
+pub struct Settings { pub shortcut: Shortcut, pub theme: Mode, pub language: Language }
 
 const CONTROL: i32 = 0x20000;
 const ALT: i32 = 0x40000;
@@ -53,7 +53,8 @@ pub fn remember_volume(id: &str, scalar: f32) {
 
 impl Settings {
     pub fn load() -> Self {
-        let mut settings = Self { shortcut: Shortcut { key: 0x78, mods: 3 }, theme: Mode::System };
+        let mut settings = Self { shortcut: Shortcut { key: 0x78, mods: 3 },
+            theme: Mode::System, language: Language::System };
         let Some(text) = runtime::read_settings() else { return settings };
         let read = |name: &str| -> Option<i32> {
             let field = format!("\"{name}\"");
@@ -69,6 +70,9 @@ impl Settings {
             }
         }
         settings.theme = match read("ThemeMode") { Some(1) => Mode::Light, Some(2) => Mode::Dark, _ => Mode::System };
+        settings.language = match read("LanguageMode") {
+            Some(1) => Language::Russian, Some(2) => Language::English, _ => Language::System,
+        };
         settings
     }
 
@@ -77,8 +81,8 @@ impl Settings {
             | (if self.shortcut.mods & 2 != 0 { CONTROL } else { 0 })
             | (if self.shortcut.mods & 4 != 0 { SHIFT } else { 0 });
         runtime::write_settings(&format!(
-            "{{\n  \"HotkeyKey\": {},\n  \"HotkeyModifiers\": {},\n  \"ThemeMode\": {}\n}}",
-            self.shortcut.key, mods, self.theme as u8))
+            "{{\n  \"HotkeyKey\": {},\n  \"HotkeyModifiers\": {},\n  \"ThemeMode\": {},\n  \"LanguageMode\": {}\n}}",
+            self.shortcut.key, mods, self.theme as u8, self.language as u8))
     }
 }
 

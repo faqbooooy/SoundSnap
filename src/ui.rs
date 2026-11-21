@@ -1,5 +1,5 @@
 use crate::{audio::{Device, Volume}, gfx::{point, rect, Color, Painter, WHITE}, palette::Palette,
-    settings::{Mode, Shortcut}};
+    locale::{tr, Language}, settings::{Mode, Shortcut}};
 use alloc::{format, vec::Vec};
 use windows_sys::Win32::Graphics::GdiPlus::RectF;
 
@@ -12,7 +12,7 @@ const TRACK_LEFT: f32 = 51.;
 const TRACK_WIDTH: f32 = 164.;
 const CLOSE_X: f32 = WIDTH - 40.;
 const CLOSE_Y: f32 = 17.;
-pub const SETTINGS_HEIGHT: i32 = 288;
+pub const SETTINGS_HEIGHT: i32 = 366;
 pub const TOAST_WIDTH: i32 = 304;
 pub const TOAST_HEIGHT: i32 = 68;
 pub const MENU_WIDTH: i32 = 157;
@@ -23,7 +23,7 @@ pub const TRAY_VOLUME_HEIGHT: i32 = 6;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Device(usize), QuickDevice(usize), EditDevices, OtherDevices, Volume, Mute, Close, Settings, Back,
-    Shortcut, Theme(u8), Startup, Cancel, Save, Open, Exit,
+    Shortcut, Theme(u8), Language(Language), Startup, Cancel, Save, Open, Exit,
     Profiles, Mixer, ProfileBack, ProfileCapture, ProfileApply(usize), ProfileEdit(usize),
     ProfileName, ProfileSave, ProfileDelete, ProfileDeactivate, ProfileOutput, ProfileFallback, ProfileOutputPick(usize),
     ProfileMuteFallback, ProfileReconnect, ProfileMaster, ProfileMasterMute, ProfileFallbackLevel,
@@ -141,8 +141,8 @@ impl OutputIcon {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Speaker => "Колонки", Self::Headphones => "Наушники",
-            Self::Monitor => "Монитор", Self::Dac => "Аудиоинтерфейс",
+            Self::Speaker => tr("Колонки"), Self::Headphones => tr("Наушники"),
+            Self::Monitor => tr("Монитор"), Self::Dac => tr("Аудиоинтерфейс"),
         }
     }
 
@@ -192,8 +192,8 @@ pub fn panel(g: &Painter, p: &Palette, model: Panel, hover: Option<Action>, focu
     if model.editing {
         let done = done_button();
         button(g,p,done,8.,if hover == Some(Action::EditDevices) {p.hover} else {0},focus == Some(Action::EditDevices));
-        g.text("Готово",done,12.,true,1,p.accent);
-        g.text("Показывать в быстром выборе",rect(17.,65.,252.,23.),13.,true,0,p.ink);
+        g.text(tr("Готово"),done,12.,true,1,p.accent);
+        g.text(tr("Показывать в быстром выборе"),rect(17.,65.,252.,23.),13.,true,0,p.ink);
         let total = model.devices.len();
         let chosen = model.excluded.iter().filter(|excluded| !**excluded).count();
         g.text(&format!("{chosen}/{total}"),rect(268.,65.,41.,23.),10.5,true,2,p.secondary_ink);
@@ -202,7 +202,7 @@ pub fn panel(g: &Painter, p: &Palette, model: Panel, hover: Option<Action>, focu
         button(g,p,gear,8.,if hover == Some(Action::Settings) {p.hover} else {0},focus == Some(Action::Settings));
         g.gear(gear.X+6.,gear.Y+5.,0.75,p.ink);
         if model.devices.is_empty() {
-            let text = if model.error { "Не удалось получить список устройств" } else { "Выходные устройства не найдены" };
+            let text = if model.error { tr("Не удалось получить список устройств") } else { tr("Выходные устройства не найдены") };
             g.text(text,rect(16.,92.,WIDTH-32.,48.),12.,false,1,p.secondary_ink);
         } else {
             draw_quick_tiles(g,p,&model,hover,focus);
@@ -212,10 +212,10 @@ pub fn panel(g: &Painter, p: &Palette, model: Panel, hover: Option<Action>, focu
             let y = list.Y+16.;
             let d = if model.expanded { -1. } else { 1. };
             g.stroke(&[point(x-4.,y-2.*d),point(x,y+2.*d),point(x+4.,y-2.*d)],1.4,p.ink);
-            g.text("Все устройства",rect(list.X+22.,list.Y,list.Width-23.,list.Height),12.5,true,0,p.ink);
+            g.text(tr("Все устройства"),rect(list.X+22.,list.Y,list.Width-23.,list.Height),12.5,true,0,p.ink);
             let edit = edit_link();
             button(g,p,edit,7.,if hover == Some(Action::EditDevices) {p.hover} else {0},focus == Some(Action::EditDevices));
-            g.text("Настроить список",rect(edit.X+4.,edit.Y,edit.Width-8.,edit.Height),12.,true,2,p.accent);
+            g.text(tr("Настроить список"),rect(edit.X+4.,edit.Y,edit.Width-8.,edit.Height),12.,true,2,p.accent);
             let pen = edit_icon();
             button(g,p,pen,8.,if hover == Some(Action::EditDevices) {p.hover} else {0},focus == Some(Action::EditDevices));
             let x = pen.X+8.;
@@ -228,8 +228,8 @@ pub fn panel(g: &Painter, p: &Palette, model: Panel, hover: Option<Action>, focu
     draw_panel_volume(g,p,model.volume,bottom,hover,focus);
     if !model.editing {
         for (slot, action, title, subtitle) in [
-            (0,Action::Mixer,"Микшер","Громкость приложений"),
-            (1,Action::Profiles,"Профили",model.profile.unwrap_or("Сценарии звука")),
+            (0,Action::Mixer,tr("Микшер"),tr("Громкость приложений")),
+            (1,Action::Profiles,tr("Профили"),model.profile.unwrap_or(tr("Сценарии звука"))),
         ] {
             let r = audio_tile(bottom,slot);
             let edge = if focus == Some(action) || (action == Action::Profiles && model.profile.is_some()) {p.accent} else {p.card_edge};
@@ -259,8 +259,8 @@ fn draw_quick_tiles(g: &Painter, p: &Palette, model: &Panel, hover: Option<Actio
         let r = tile_rect(slot);
         let Some(index) = index else {
             g.rounded(r,12.,p.card_fill,Some(p.card_edge));
-            g.text("Нет второго выхода",rect(r.X+10.,r.Y+28.,r.Width-20.,25.),11.5,false,1,p.secondary_ink);
-            g.text("Настроить список ↓",rect(r.X+10.,r.Y+54.,r.Width-20.,25.),10.,false,1,p.secondary_ink);
+            g.text(tr("Нет второго выхода"),rect(r.X+10.,r.Y+28.,r.Width-20.,25.),11.5,false,1,p.secondary_ink);
+            g.text(tr("Настроить список ↓"),rect(r.X+10.,r.Y+54.,r.Width-20.,25.),10.,false,1,p.secondary_ink);
             continue;
         };
         let device = &model.devices[index];
@@ -354,25 +354,35 @@ pub struct SettingsView {
     pub capture: bool,
     pub feedback: &'static str,
     pub theme_hint: &'static str,
+    pub language_error: bool,
 }
 pub const MODES: [Mode; 3] = [Mode::Light, Mode::Dark, Mode::System];
-pub fn settings_controls() -> [(Action, RectF);9] {
+pub fn settings_controls() -> [(Action, RectF);12] {
     [(Action::Back,rect(16.,17.,34.,34.)),(Action::Shortcut,rect(16.,89.,WIDTH-32.,32.)),
      (Action::Theme(0),rect(16.,162.,94.,30.)),(Action::Theme(1),rect(116.,162.,94.,30.)),
-     (Action::Theme(2),rect(216.,162.,94.,30.)),(Action::Startup,rect(17.,213.,WIDTH-34.,24.)),
-     (Action::Cancel,rect(WIDTH-184.,249.,78.,29.)),(Action::Save,rect(WIDTH-98.,249.,82.,29.)),
+     (Action::Theme(2),rect(216.,162.,94.,30.)),
+     (Action::Language(Language::System),rect(16.,238.,94.,30.)),
+     (Action::Language(Language::English),rect(116.,238.,94.,30.)),
+     (Action::Language(Language::Russian),rect(216.,238.,94.,30.)),
+     (Action::Startup,rect(17.,290.,WIDTH-34.,24.)),
+     (Action::Cancel,rect(WIDTH-184.,327.,78.,29.)),(Action::Save,rect(WIDTH-98.,327.,82.,29.)),
      (Action::Close,rect(CLOSE_X,CLOSE_Y,26.,26.))]
 }
-pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode, hover: Option<Action>,focus: Option<Action>) {
+pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode,language: Language,
+    hover: Option<Action>,focus: Option<Action>) {
     g.gradient(rect(0.5,0.5,WIDTH-1.,SETTINGS_HEIGHT as f32-1.),23.,p.glass_start,p.glass_end,p.glass_edge);
-    g.text("Настройки",rect(57.,17.,CLOSE_X-61.,34.),18.,true,0,p.ink);
+    g.text(tr("Настройки"),rect(57.,17.,CLOSE_X-61.,34.),18.,true,0,p.ink);
     close(g,p,CLOSE_X,CLOSE_Y,hover == Some(Action::Close),focus == Some(Action::Close));
     g.fill(rect(16.,60.,WIDTH-32.,1.),p.line);
-    g.text("ГОРЯЧАЯ КЛАВИША",rect(16.,68.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
-    g.text("ОФОРМЛЕНИЕ",rect(16.,141.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
-    g.text(form.feedback,rect(16.,122.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
-    g.text(form.theme_hint,rect(16.,194.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
-    g.fill(rect(16.,242.,WIDTH-32.,1.),p.line);
+    g.text(tr("ГОРЯЧАЯ КЛАВИША"),rect(16.,68.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
+    g.text(tr("ОФОРМЛЕНИЕ"),rect(16.,141.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
+    g.text(tr("ЯЗЫК"),rect(16.,215.,WIDTH-32.,18.),11.,true,0,p.secondary_ink);
+    g.text(tr(form.feedback),rect(16.,122.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
+    g.text(tr(form.theme_hint),rect(16.,194.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
+    if form.language_error {
+        g.text(tr("Не удалось сохранить язык."),rect(16.,269.,WIDTH-32.,17.),10.5,false,0,p.secondary_ink);
+    }
+    g.fill(rect(16.,320.,WIDTH-32.,1.),p.line);
     for (action, r) in settings_controls() {
         let active = hover == Some(action);
         let focused = focus == Some(action);
@@ -385,7 +395,7 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode, hover: O
             }
             Action::Shortcut => {
                 button(g,p,r,11.,if active {p.hover} else {p.selected},focused);
-                let text = if form.capture { "Нажмите клавишу или сочетание…".into() }
+                let text = if form.capture { tr("Нажмите клавишу или сочетание…").into() }
                     else { form.shortcut.labels().join(" + ") };
                 g.text(&text,r,11.5,true,1,p.accent);
             }
@@ -394,21 +404,33 @@ pub fn settings(g: &Painter,p: &Palette,form: &SettingsView,mode: Mode, hover: O
                 let checked = MODES[index] == mode;
                 let fill = if active {p.hover} else if checked {p.selected} else {p.elevated};
                 g.rounded(r,9.,fill,Some(if focused {p.focus} else {p.border}));
-                g.text(["Светлая","Тёмная","Как в Windows"][index],r,11.5,false,1,p.ink);
+                g.text([tr("Светлая"),tr("Тёмная"),tr("Как в Windows")][index],r,11.5,false,1,p.ink);
+            }
+            Action::Language(choice) => {
+                let checked = language == choice;
+                let fill = if active {p.hover} else if checked {p.selected} else {p.elevated};
+                let edge = if focused {p.focus} else if checked {p.accent} else {p.border};
+                g.rounded(r,9.,fill,Some(edge));
+                let text = match choice {
+                    Language::System => tr("Как в Windows"),
+                    Language::English => "English",
+                    Language::Russian => "Русский",
+                };
+                g.text(text,r,11.5,checked,1,p.ink);
             }
             Action::Startup => {
                 let y = r.Y + 6.;
                 g.rounded(rect(r.X + 1.,y,14.,14.),2.,if form.startup {p.save} else {p.surface},
                     Some(if focused {p.focus} else {p.border}));
                 if form.startup { g.stroke(&[point(r.X+4.,y+7.),point(r.X+7.,y+10.),point(r.X+12.,y+3.)],1.6,WHITE); }
-                g.text("Запускать вместе с Windows",rect(r.X+19.,r.Y,r.Width-19.,r.Height),12.,false,0,p.ink);
+                g.text(tr("Запускать вместе с Windows"),rect(r.X+19.,r.Y,r.Width-19.,r.Height),12.,false,0,p.ink);
             }
             Action::Cancel | Action::Save => {
                 let save = action == Action::Save;
                 let fill = match (save, active) { (true,true)=>p.save_hover,(true,false)=>p.save,
                     (false,true)=>p.hover,(false,false)=>p.elevated };
                 button(g,p,r,11.,fill,focused);
-                g.text(if save {"Сохранить"} else {"Отмена"},r,11.5,true,1,if save {WHITE} else {p.ink});
+                g.text(if save {tr("Сохранить")} else {tr("Отмена")},r,11.5,true,1,if save {WHITE} else {p.ink});
             }
             _ => (),
         }
@@ -423,7 +445,7 @@ pub fn menu_controls() -> [(Action, RectF);5] {
 pub fn menu(g: &Painter,p: &Palette,hover: Option<Action>,focus: Option<Action>) {
     g.rounded(rect(0.5,0.5,156.,141.),5.,p.surface,Some(p.border));
     g.fill(rect(6.,108.,145.,1.),p.border);
-    for ((action,r), text) in menu_controls().into_iter().zip(["Открыть","Микшер","Профили","Настройки","Выход"]) {
+    for ((action,r), text) in menu_controls().into_iter().zip([tr("Открыть"),tr("Микшер"),tr("Профили"),tr("Настройки"),tr("Выход")]) {
         if hover == Some(action) || focus == Some(action) { g.rounded(r,4.,p.hover,None); }
         g.text(text,rect(r.X+9.,r.Y,r.Width-9.,r.Height),12.,false,0,p.ink);
     }
